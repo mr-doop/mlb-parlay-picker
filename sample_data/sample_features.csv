@@ -1,2 +1,0 @@
-player_id,pitcher_k_rate,pitcher_bb_rate,opp_k_rate,opp_bb_rate,last5_pitch_ct_mean,days_rest,leash_bias,favorite_flag,bullpen_freshness,park_k_factor,ump_k_bias,team_ml_vigfree
-cole_g,0.30,0.07,0.25,0.08,95,5,0.2,1,4.0,1.05,1.02,0.58
