@@ -202,10 +202,11 @@ with tab1:
     cand = add_pct_cols(pool[show_cols])
     show_cols_disp = ["date","game_id","category","side","team","player_name","alt_line",
                       "american_odds","decimal_odds","Model q %","Market %","Edge %","ev","description"]
-    st.dataframe(
-        cand[show_cols_disp].sort_values(["q_model","edge","decimal_odds"], ascending=[False,False,False]),
-        use_container_width=True, height=500, column_config=colcfg, hide_index=True
-    )
+    cand_sorted = cand.sort_values(["q_model","edge","decimal_odds"], ascending=[False,False,False])
+st.dataframe(
+    cand_sorted[show_cols_disp],
+    use_container_width=True, height=500, column_config=colcfg, hide_index=True
+)
     st.caption("Note: Values reflect current filters (odds slider, categories, games, search).")
 
 # ---------------------------------- Top 20 Bets
