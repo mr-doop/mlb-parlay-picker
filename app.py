@@ -197,16 +197,29 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
 # ---------------------------------- Candidates
 with tab1:
     st.markdown('<div class="block-title">Candidate Legs (post‑filter)</div>', unsafe_allow_html=True)
-    show_cols = ["date","game_id","category","market_type","side","team","player_name","alt_line",
-                 "american_odds","decimal_odds","q_model","p_market","edge","ev","description"]
+
+    show_cols = [
+        "date","game_id","category","market_type","side","team","player_name","alt_line",
+        "american_odds","decimal_odds","q_model","p_market","edge","ev","description"
+    ]
     cand = add_pct_cols(pool[show_cols])
-    show_cols_disp = ["date","game_id","category","side","team","player_name","alt_line",
-                      "american_odds","decimal_odds","Model q %","Market %","Edge %","ev","description"]
-    cand_sorted = cand.sort_values(["q_model","edge","decimal_odds"], ascending=[False,False,False])
-st.dataframe(
-    cand_sorted[show_cols_disp],
-    use_container_width=True, height=500, column_config=colcfg, hide_index=True
-)
+
+    show_cols_disp = [
+        "date","game_id","category","side","team","player_name","alt_line",
+        "american_odds","decimal_odds","Model q %","Market %","Edge %","ev","description"
+    ]
+
+    # Sort FIRST on columns that exist in cand, THEN slice to display columns
+    cand_sorted = cand.sort_values(["q_model","edge","decimal_odds"], ascending=[False, False, False])
+
+    st.dataframe(
+        cand_sorted[show_cols_disp],
+        use_container_width=True,
+        height=500,
+        column_config=colcfg,
+        hide_index=True
+    )
+
     st.caption("Note: Values reflect current filters (odds slider, categories, games, search).")
 
 # ---------------------------------- Top 20 Bets
