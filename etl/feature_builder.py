@@ -5,6 +5,7 @@ from functools import reduce
 import pandas as pd
 
 from etl.sources import weather, park_factors, opp_rates, bullpen
+from etl.sources import pitcher_form
 
 DEFAULTS = {
     "pitcher_k_rate": 0.24,
