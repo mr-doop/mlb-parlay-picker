@@ -3,6 +3,10 @@
 
 from typing import Dict
 import pandas as pd
+import re
+
+def _team_key(s: str) -> str:
+    return re.sub(r'[^A-Za-z]', '', s or '')
 
 PARK_FACTORS: Dict[str, Dict] = {
     "ArizonaDiamondbacks":   {"park_run_factor":1.03, "park_k_factor":0.98},
@@ -37,16 +41,18 @@ PARK_FACTORS: Dict[str, Dict] = {
     "WashingtonNationals":   {"park_run_factor":1.01, "park_k_factor":1.00},
 }
 
+def home_from_gid(gid: str) -> str:
+    try:
+        return _team_key(gid.split("-")[1])
+    except Exception:
+        return ""
+
 def build(date: str, dk_df: pd.DataFrame) -> pd.DataFrame:
-    def home_from_gid(gid: str) -> str:
-        try: return gid.split("-")[1]
-        except Exception: return ""
     m = dk_df[dk_df["player_id"].notna()][["player_id","game_id"]].drop_duplicates()
-    if m.empty: return pd.DataFrame(columns=["player_id","park_run_factor","park_k_factor"])
-    m["home_key"] = m["game_id"].map(lambda x: home_from_gid(x))
-    pf = pd.DataFrame([
-        {"home_key": k, **v} for k, v in PARK_FACTORS.items()
-    ])
+    if m.empty:
+        return pd.DataFrame(columns=["player_id","park_run_factor","park_k_factor"])
+    m["home_key"] = m["game_id"].map(home_from_gid)
+    pf = pd.DataFrame([{"home_key": k, **v} for k, v in PARK_FACTORS.items()])
     res = m.merge(pf, on="home_key", how="left").drop(columns=["game_id","home_key"])
     res["park_run_factor"] = res["park_run_factor"].fillna(1.00)
     res["park_k_factor"]   = res["park_k_factor"].fillna(1.00)
