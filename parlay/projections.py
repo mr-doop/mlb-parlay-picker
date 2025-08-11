@@ -156,13 +156,33 @@ def apply_projections(legs_df: pd.DataFrame, features_df: pd.DataFrame) -> pd.Da
         return val if str(r.get("side","")).upper()=="OVER" else (1.0 - val if pd.notna(val) else np.nan)
     df.loc[mask_outs, "q_proj"] = df[mask_outs].apply(_outs_prob, axis=1)
 
-    # ----- Pitcher Win -----
-    mask_win = df["market_type"].eq("PITCHER_WIN")
-    vf_team = df.get("team_ml_vigfree").fillna(df.get("vigfree_p", 0.5)).astype(float)
-    p_ip_ge5 = df.apply(lambda r: project_outs_probs(r.get("expected_ip", 5.5), _num(r.get("leash_bias"), 0.0)).get(14.5, 0.6), axis=1)
-    df.loc[mask_win, "q_proj"] = [
-        project_win_prob(vf_team.iloc[i], p_ip_ge5.iloc[i]) for i in df.index
-    ]
-    df.loc[mask_win & df["side"].str.upper().eq("NO"), "q_proj"] = 1.0 - df.loc[mask_win & df["side"].str.upper().eq("NO"), "q_proj"]
+# ----- Pitcher Win -----
+mask_win = df["market_type"].eq("PITCHER_WIN")
 
-    return df
+# team ML probability (vig-free if provided; fallback to market)
+vf_team = df.get("team_ml_vigfree").fillna(df.get("vigfree_p", 0.5)).astype(float)
+
+# probability the starter reaches 5 IP (≈ 15 outs) – use 14.5 as cutoff
+p_ip_ge5 = df.apply(
+    lambda r: project_outs_probs(
+        _num(r.get("expected_ip"), defaults["days_rest"]),    # expected_ip already computed above
+        _num(r.get("leash_bias"), 0.0)
+    ).get(14.5, 0.6),
+    axis=1
+)
+
+# Compute win prob ONLY on masked rows, return a Series aligned to mask index
+q_win_series = df.loc[mask_win].apply(
+    lambda r: project_win_prob(
+        vf_team.loc[r.name],
+        p_ip_ge5.loc[r.name]
+    ),
+    axis=1
+)
+
+# Assign back to masked rows
+df.loc[mask_win, "q_proj"] = q_win_series
+
+# If side is NO, flip the probability on those masked rows only
+mask_win_no = mask_win & df["side"].str.upper().eq("NO")
+df.loc[mask_win_no, "q_proj"] = 1.0 - df.loc[mask_win_no, "q_proj"]
