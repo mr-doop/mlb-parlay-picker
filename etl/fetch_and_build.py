@@ -21,9 +21,16 @@ class DKRow:
     player_id: str; player_name: str; alt_line: str; american_odds: int
 
 def _key() -> str:
-    k = st.secrets.get("ODDS_API_KEY") or os.getenv("ODDS_API_KEY")
+    try:
+        # If st.secrets is a dict-like object
+        if hasattr(st.secrets, "__getitem__"):
+            return st.secrets["ODDS_API_KEY"]
+    except Exception:
+        pass
+    # Fallback to environment variable
+    k = os.getenv("ODDS_API_KEY")
     if not k:
-        raise RuntimeError("ODDS_API_KEY missing in Streamlit Secrets")
+        raise RuntimeError("ODDS_API_KEY missing (add it in Streamlit Secrets or environment).")
     return k
 
 def _get(url: str, params: Dict[str, Any]) -> Any:
