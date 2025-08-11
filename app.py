@@ -3,6 +3,13 @@ from parlay.odds import compute_vig_free_probs
 from parlay.builder import build_parlay_greedy
 from parlay.describe import describe_row
 st.set_page_config(page_title="MLB Parlay Picker — MVP", layout="wide")
+
+try:
+    _ = st.secrets["ODDS_API_KEY"]
+    st.sidebar.success("Secret detected ✔︎")
+except Exception:
+    st.sidebar.error("No ODDS_API_KEY in Secrets ✖︎")
+
 st.title("MLB Parlay Picker — MVP")
 st.caption("DraftKings + Alternate Lines | Cross-game only (MVP) | Uses vig-free market probabilities as q")
 
