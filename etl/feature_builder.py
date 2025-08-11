@@ -49,6 +49,8 @@ def build_features(date: str, dk_df: pd.DataFrame) -> pd.DataFrame:
     except Exception: pass
     try: frames.append(bullpen.build(date, dk_df))
     except Exception: pass
+    try: frames.append(pitcher_form.build(date, dk_df))   # <-- add this line
+    except Exception: pass
 
     feats = reduce(_left_join, frames)
     feats = fill_defaults(feats)
