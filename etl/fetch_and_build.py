@@ -1,282 +1,84 @@
 # etl/fetch_and_build.py
-# ---------------------------------------------------------------------
-# Fetch DraftKings MLB markets + pitcher props from The Odds API,
-# normalize into a single CSV, then build a features CSV using
-# public sources (weather, park factors, opponent rates, bullpen, etc.).
-#
-# Requires Streamlit Secret or env var:
-#   ODDS_API_KEY = "<your_the_odds_api_key>"
-#
-# Output:
-#   dk_markets_YYYY-MM-DD.csv
-#   features_YYYY-MM-DD.csv
-# ---------------------------------------------------------------------
+from __future__ import annotations
+import os, io, datetime as dt, requests, pandas as pd
+from .sources.mlb_schedule import fetch_schedule
+from .sources.probable_pitchers import fetch_probable_pitchers
+from .sources.opp_rates import load_opp_rates
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Tuple
-import re
-import csv
-import os
-import time
-import datetime as dt
+ODDS_BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
 
-import requests
-import pandas as pd
-import streamlit as st
+def _get_api_key() -> str:
+    k = os.getenv("ODDS_API_KEY", "")
+    if not k:
+        raise RuntimeError("Missing ODDS_API_KEY in environment/secrets")
+    return k
 
-# ------------------------- API constants ------------------------------
-SPORT = "baseball_mlb"
-ROOT = "https://api.the-odds-api.com/v4"
-
-# Game-level markets (pull once for the slate)
-GAME_MARKETS = "h2h,spreads"
-
-# Event-level player prop markets (must be fetched per event)
-# Valid MLB keys (no 'player_' prefix here)
-PROP_MARKETS = ",".join([
-    "pitcher_strikeouts",
-    "pitcher_strikeouts_alternate",
-    "pitcher_outs",
-    "pitcher_walks",
-    "pitcher_walks_alternate",
-    "pitcher_record_a_win",
-])
-
-# ------------------------- CSV row type -------------------------------
-@dataclass
-class DKRow:
-    date: str
-    game_id: str
-    market_type: str         # MONEYLINE / RUN_LINE / ALT_RUN_LINE / PITCHER_KS / PITCHER_OUTS / PITCHER_WALKS / PITCHER_WIN
-    side: str                # HOME/AWAY for ML; Over/Under/Yes/No for props; team name for run lines
-    team: str                # team for spreads/ML; blank for most props
-    player_id: str           # stable id from player_name (lowercase last_firstInitial)
-    player_name: str         # display name from Odds API
-    alt_line: str            # numeric line for alt/props (e.g., 4.5 Ks, 17.5 outs, +1.5 RL); empty if N/A
-    american_odds: int       # DK price
-
-# ------------------------- helpers -----------------------------------
-def _key() -> str:
-    """Get API key from Streamlit Secrets or environment."""
-    try:
-        return str(st.secrets["ODDS_API_KEY"])
-    except Exception:
-        k = os.getenv("ODDS_API_KEY")
-        if not k:
-            raise RuntimeError("ODDS_API_KEY missing -- add it in Streamlit → Manage app → Settings → Secrets")
-        return str(k)
-
-def _get(url: str, params: Dict[str, Any]) -> Any:
-    r = requests.get(url, params=params, timeout=60)
+def _fetch_dk_board(date_str: str) -> pd.DataFrame:
+    """Fetch DK board for H2H + spreads to guarantee games are present. Player props
+       may require a paid plan; we keep event coverage robust even without them."""
+    params = {
+        "apiKey": _get_api_key(),
+        "regions": "us",
+        "markets": "h2h,spreads",  # conservative to avoid INVALID_MARKET/401 on free plans
+        "oddsFormat": "american",
+        "bookmakers": "draftkings",
+        "dateFormat": "iso"
+    }
+    r = requests.get(ODDS_BASE, params=params, timeout=20)
+    if r.status_code == 401:
+        raise RuntimeError("Unauthorized from The Odds API (check key/plan)")
     r.raise_for_status()
-    return r.json()
+    data = r.json()
 
-def _team_key(name: str) -> str:
-    """Sanitize team tokens to letters only to match feature maps (e.g., 'St.Louis Cardinals' → 'StLouisCardinals')."""
-    return re.sub(r'[^A-Za-z]', '', (name or ''))
-
-def _norm_game_id(date: str, home: str, away: str) -> str:
-    # "YYYY-MM-DD-Home-Away" with sanitized team tokens
-    return f"{date}-{_team_key(home)}-{_team_key(away)}"
-
-def _pid_from_name(name: str) -> str:
-    # crude stable id: last_firstInitial
-    parts = [p for p in (name or "").replace(".", "").split(" ") if p]
-    if not parts:
-        return (name or "").lower()
-    first = parts[0]
-    last = parts[-1]
-    return f"{last.lower()}_{first[0].lower()}"
-
-# ------------------------- API calls ---------------------------------
-def fetch_games(date: str) -> List[Dict[str, Any]]:
-    """
-    Get slate with DK game markets (h2h, spreads).
-    The Odds API /odds returns upcoming events; filter client-side by date.
-    """
-    url = f"{ROOT}/sports/{SPORT}/odds"
-    params = {
-        "apiKey": _key(),
-        "regions": "us",
-        "markets": GAME_MARKETS,
-        "oddsFormat": "american",
-        "bookmakers": "draftkings",
-    }
-    j = _get(url, params)
-    keep = []
-    d_req = pd.to_datetime(date).date()
-    for g in j:
-        try:
-            d = pd.to_datetime(g.get("commence_time")).date()
-            if d == d_req:
-                keep.append(g)
-        except Exception:
-            keep.append(g)
-    return keep
-
-def fetch_props_for_event(event_id: str) -> Any:
-    """Fetch DK props for a single event via event-level ODDS endpoint."""
-    url = f"{ROOT}/sports/{SPORT}/events/{event_id}/odds"
-    params = {
-        "apiKey": _key(),
-        "regions": "us",
-        "markets": PROP_MARKETS,
-        "oddsFormat": "american",
-        "bookmakers": "draftkings",
-    }
-    return _get(url, params)
-
-def _iter_dk_markets_from_event_response(event_odds: Any):
-    """
-    Normalize The Odds API event-level response into (market_key, outcomes) for DraftKings only.
-    Supports both shapes we encounter.
-    """
-    # Shape A: list[ { key, bookmakers: [ { key, markets: [ { key, outcomes } ] } ] } ]
-    if isinstance(event_odds, list):
-        for m in event_odds:
-            base_key = str(m.get("key", "")).lower()
-            for bm in m.get("bookmakers", []):
-                if bm.get("key") != "draftkings":
-                    continue
-                for mk in bm.get("markets", []):
-                    mkey = str(mk.get("key", base_key)).lower()
-                    outs = mk.get("outcomes", [])
-                    if outs:
-                        yield mkey, outs
-        return
-    # Shape B: dict { bookmakers: [ { key, markets: [ ... ] } ] }
-    if isinstance(event_odds, dict):
-        for bm in event_odds.get("bookmakers", []):
+    rows = []
+    for ev in data:
+        event_id = ev.get("id","")
+        home = ev.get("home_team",""); away = ev.get("away_team","")
+        # market odds may be multiple; pick DK
+        for bm in ev.get("bookmakers", []):
             if bm.get("key") != "draftkings":
                 continue
+            # H2H -> moneylines
             for mk in bm.get("markets", []):
-                mkey = str(mk.get("key", "")).lower()
-                outs = mk.get("outcomes", [])
-                if outs:
-                    yield mkey, outs
+                mkt_key = mk.get("key")
+                for out in mk.get("outcomes", []):
+                    team = out.get("name","")
+                    price = int(out.get("price", 0))
+                    rows.append({
+                        "date": date_str,
+                        "game_id": f"{date_str}-{home.replace(' ','')}-{away.replace(' ','')}",
+                        "market_type": "MONEYLINE" if mkt_key == "h2h" else "RUN_LINE",
+                        "team": team,
+                        "side": "YES",
+                        "alt_line": None,
+                        "american_odds": price,
+                        "player_id": None,
+                        "player_name": None
+                    })
+    return pd.DataFrame(rows)
 
-# ------------------------- row builder -------------------------------
-def build_rows(date: str, games: List[Dict[str, Any]]) -> List[DKRow]:
-    rows: List[DKRow] = []
+def run(date_str: str) -> tuple[pd.DataFrame, pd.DataFrame, bytes, bytes, pd.DataFrame, pd.DataFrame]:
+    """Return (odds_df, feat_df, odds_csv_bytes, feat_csv_bytes, schedule_df, pitchers_df)."""
+    # 1) schedule (authoritative game coverage)
+    schedule_df = fetch_schedule(date_str)
 
-    for g in games:
-        event_id = g.get("id") or g.get("event_id")
-        home = g.get("home_team", "HOME")
-        away = g.get("away_team", "AWAY")
-        gid = _norm_game_id(date, home, away)
-
-        # 1) Game markets (ML + spreads)
-        for bm in g.get("bookmakers", []):
-            if bm.get("key") != "draftkings":
-                continue
-            for mk in bm.get("markets", []):
-                mkey = str(mk.get("key", "")).lower()
-                if mkey == "h2h":
-                    for out in mk.get("outcomes", []):
-                        side = "HOME" if out.get("name") == home else "AWAY"
-                        rows.append(DKRow(
-                            date, gid, "MONEYLINE", side,
-                            out.get("name", ""), "", "", "",
-                            int(out.get("price", 0))
-                        ))
-                elif mkey == "spreads":
-                    for out in mk.get("outcomes", []):
-                        spread = out.get("point")
-                        team = out.get("name", "")
-                        mt = "RUN_LINE" if (spread is not None and abs(float(spread)) == 1.5) else "ALT_RUN_LINE"
-                        rows.append(DKRow(
-                            date, gid, mt, team, team,
-                            "", "", str(spread) if spread is not None else "",
-                            int(out.get("price", 0))
-                        ))
-
-        # 2) Event-level props (Ks/Outs/Walks/Win)
-        if not event_id:
-            continue
-        try:
-            props = fetch_props_for_event(event_id)
-        except requests.HTTPError as e:
-            st.warning(f"Props fetch failed for {gid}: {e}")
-            time.sleep(0.15)
-            continue
-
-        for mkey, outcomes in _iter_dk_markets_from_event_response(props):
-            lk = mkey.lower()
-            for out in outcomes:
-                name = str(out.get("name", ""))            # 'Over'/'Under'/'Yes'/'No'
-                desc = str(out.get("description", ""))     # player name
-                label = desc or name
-                price = int(out.get("price", 0))
-                point = out.get("point", None)
-
-                if "strikeout" in lk:
-                    side = "OVER" if "over" in name.lower() else ("UNDER" if "under" in name.lower() else "")
-                    rows.append(DKRow(
-                        date, gid, "PITCHER_KS", side, "",
-                        _pid_from_name(label), label,
-                        str(point) if point is not None else "", price
-                    ))
-                elif "outs" in lk:
-                    side = "OVER" if "over" in name.lower() else ("UNDER" if "under" in name.lower() else "")
-                    rows.append(DKRow(
-                        date, gid, "PITCHER_OUTS", side, "",
-                        _pid_from_name(label), label,
-                        str(point) if point is not None else "", price
-                    ))
-                elif "walks" in lk:
-                    side = "OVER" if "over" in name.lower() else ("UNDER" if "under" in name.lower() else "")
-                    rows.append(DKRow(
-                        date, gid, "PITCHER_WALKS", side, "",
-                        _pid_from_name(label), label,
-                        str(point) if point is not None else "", price
-                    ))
-                elif "record_a_win" in lk or "to_record_a_win" in lk or "pitcher_record_a_win" in lk:
-                    side = "YES" if "yes" in name.lower() else ("NO" if "no" in name.lower() else "")
-                    rows.append(DKRow(
-                        date, gid, "PITCHER_WIN", side, "",
-                        _pid_from_name(label), label,
-                        "", price
-                    ))
-        time.sleep(0.10)  # be gentle on rate limits
-
-    return rows
-
-# ------------------------- IO helpers --------------------------------
-def write_csv(path: str, rows: List[DKRow]) -> None:
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["date","game_id","market_type","side","team","player_id","player_name","alt_line","american_odds"])
-        for r in rows:
-            w.writerow([r.date, r.game_id, r.market_type, r.side, r.team, r.player_id, r.player_name, r.alt_line, r.american_odds])
-
-# ------------------------- public entrypoint --------------------------
-def run(date: str) -> Tuple[str, str]:
-    """
-    Build both CSVs for the given date.
-    Returns: (odds_csv_path, features_csv_path)
-    """
-    # 1) DK odds CSV
-    games = fetch_games(date)
-    rows = build_rows(date, games)
-    odds_path = f"dk_markets_{date}.csv"
-    write_csv(odds_path, rows)
-
-    # 2) Features CSV (weather, park, opp, bullpen, pitcher_form via feature_builder)
-    from etl.feature_builder import build_features
+    # 2) odds (DK) for base markets (ensures DK games we do see have odds)
     try:
-        dk_df = pd.read_csv(odds_path)
-        feats = build_features(date, dk_df)
-        feat_path = f"features_{date}.csv"
-        feats.to_csv(feat_path, index=False)
-    except Exception as e:
-        st.warning(f"Feature build failed, writing skeleton features: {e}")
-        feat_path = f"features_{date}.csv"
-        pd.DataFrame(columns=["player_id"]).to_csv(feat_path, index=False)
+        odds_base = _fetch_dk_board(date_str)
+    except Exception:
+        odds_base = pd.DataFrame(columns=["date","game_id","market_type","team","side","alt_line","american_odds","player_id","player_name"])
 
-    return odds_path, feat_path
+    # 3) probable pitchers (drives team mapping for props and helps with display)
+    pitchers_df = fetch_probable_pitchers(date_str)
 
-# Allow running from CLI
-if __name__ == "__main__":
-    today = dt.date.today().strftime("%Y-%m-%d")
-    o, f = run(today)
-    print("Wrote:", o, f)
+    # 4) baseline features from opponent rates (global; detailed per leg happens in app)
+    opp_rates = load_opp_rates()
+
+    # Minimal features DF: we’ll fill more in app once legs are known
+    feat_df = pd.DataFrame({"player_id": [], "q_proj": []})  # placeholder
+
+    # CSV bytes for download buttons
+    odds_csv = odds_base.to_csv(index=False).encode("utf-8")
+    feat_csv = feat_df.to_csv(index=False).encode("utf-8")
+
+    return odds_base, feat_df, odds_csv, feat_csv, schedule_df, pitchers_df

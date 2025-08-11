@@ -20,27 +20,30 @@ def _abbr(tok: str) -> str: return ABBR.get(tok, (tok[:3] or "???").upper())
 def matchup(gid: str) -> str:
     try:
         p = gid.split("-")
-        home = _abbr(_tok(p[-2]))
-        away = _abbr(_tok(p[-1]))
-        return f"{away}@{home}"
+        return f"{_abbr(_tok(p[-1]))}@{_abbr(_tok(p[-2]))}"  # away@home
     except Exception:
         return "???@???"
 
 def compact_player(name: str) -> str:
-    parts = [p for p in (name or "").replace(".", "").split(" ") if p]
+    parts = [p for p in (name or "").replace(".", "").split() if p]
     if not parts: return name or ""
     if len(parts) == 1: return parts[0]
     return f"{parts[0][0]}. {parts[-1]}"
 
-def _player_team_abbr(r: pd.Series) -> str:
-    # Prefer explicit team field; else attempt to infer from game_id + side
-    team_raw = str(r.get("team","")).strip()
-    if team_raw:
-        return _abbr(_tok(team_raw))
-    # Fallback: use home from matchup (better than ???)
-    gid = r.get("game_id","")
+def team_for_pitcher(row: pd.Series) -> str:
+    # Prefer 'team' column (hydrated via probable pitchers join).
+    team = str(row.get("team_abbr","") or row.get("team","") or "").strip()
+    if team: return team
+    # Fallback: infer from game_id with side hint if present
+    gid = row.get("game_id","")
     try:
-        return matchup(gid).split("@")[1]
+        p = gid.split("-")
+        home = _abbr(_tok(p[-2])); away = _abbr(_tok(p[-1]))
+        # If player_side exists, use it; else unknown
+        side = str(row.get("player_side","")).lower()
+        if side == "home": return home
+        if side == "away": return away
+        return home  # neutral fallback
     except Exception:
         return "???"
 
@@ -50,7 +53,7 @@ def describe_row(r: pd.Series) -> str:
     line = r.get("alt_line","")
     name = str(r.get("player_name","")).strip()
     m    = matchup(r.get("game_id",""))
-    team = _player_team_abbr(r)
+    team = team_for_pitcher(r)
     ou   = "O" if side == "OVER" else ("U" if side == "UNDER" else side)
 
     if mt == "MONEYLINE":
