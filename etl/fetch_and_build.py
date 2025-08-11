@@ -2,9 +2,9 @@
 # ---------------------------------------------------------------------
 # Fetch DraftKings MLB markets + pitcher props from The Odds API,
 # normalize into a single CSV, then build a features CSV using
-# public sources (weather, park factors, opponent rates, bullpen).
+# public sources (weather, park factors, opponent rates, bullpen, etc.).
 #
-# Requires a Streamlit Secret or env var:
+# Requires Streamlit Secret or env var:
 #   ODDS_API_KEY = "<your_the_odds_api_key>"
 #
 # Output:
@@ -14,7 +14,7 @@
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
-
+import re
 import csv
 import os
 import time
@@ -48,11 +48,11 @@ class DKRow:
     date: str
     game_id: str
     market_type: str         # MONEYLINE / RUN_LINE / ALT_RUN_LINE / PITCHER_KS / PITCHER_OUTS / PITCHER_WALKS / PITCHER_WIN
-    side: str                # e.g. HOME/AWAY for ML, Over/Under/Yes/No for props, or team name for run lines
-    team: str                # team name (for spreads/ML), blank for most props
+    side: str                # HOME/AWAY for ML; Over/Under/Yes/No for props; team name for run lines
+    team: str                # team for spreads/ML; blank for most props
     player_id: str           # stable id from player_name (lowercase last_firstInitial)
     player_name: str         # display name from Odds API
-    alt_line: str            # numeric line for alt/props (e.g., 4.5 Ks, 17.5 outs, +1.5 RL); empty if NA
+    alt_line: str            # numeric line for alt/props (e.g., 4.5 Ks, 17.5 outs, +1.5 RL); empty if N/A
     american_odds: int       # DK price
 
 # ------------------------- helpers -----------------------------------
@@ -71,15 +71,19 @@ def _get(url: str, params: Dict[str, Any]) -> Any:
     r.raise_for_status()
     return r.json()
 
+def _team_key(name: str) -> str:
+    """Sanitize team tokens to letters only to match feature maps (e.g., 'St.Louis Cardinals' → 'StLouisCardinals')."""
+    return re.sub(r'[^A-Za-z]', '', (name or ''))
+
 def _norm_game_id(date: str, home: str, away: str) -> str:
-    # "YYYY-MM-DD-HomeTeamNoSpaces-AwayTeamNoSpaces"
-    return f"{date}-{home.replace(' ', '')}-{away.replace(' ', '')}"
+    # "YYYY-MM-DD-Home-Away" with sanitized team tokens
+    return f"{date}-{_team_key(home)}-{_team_key(away)}"
 
 def _pid_from_name(name: str) -> str:
     # crude stable id: last_firstInitial
-    parts = [p for p in name.replace(".", "").split(" ") if p]
+    parts = [p for p in (name or "").replace(".", "").split(" ") if p]
     if not parts:
-        return name.lower()
+        return (name or "").lower()
     first = parts[0]
     last = parts[-1]
     return f"{last.lower()}_{first[0].lower()}"
@@ -88,7 +92,7 @@ def _pid_from_name(name: str) -> str:
 def fetch_games(date: str) -> List[Dict[str, Any]]:
     """
     Get slate with DK game markets (h2h, spreads).
-    The Odds API /odds returns upcoming events; we filter client-side by date.
+    The Odds API /odds returns upcoming events; filter client-side by date.
     """
     url = f"{ROOT}/sports/{SPORT}/odds"
     params = {
@@ -99,7 +103,6 @@ def fetch_games(date: str) -> List[Dict[str, Any]]:
         "bookmakers": "draftkings",
     }
     j = _get(url, params)
-    # Keep only games whose commence_time date matches `date` (UTC vs local caveat--good enough for MVP)
     keep = []
     d_req = pd.to_datetime(date).date()
     for g in j:
@@ -126,7 +129,7 @@ def fetch_props_for_event(event_id: str) -> Any:
 def _iter_dk_markets_from_event_response(event_odds: Any):
     """
     Normalize The Odds API event-level response into (market_key, outcomes) for DraftKings only.
-    Supports both possible shapes we encounter.
+    Supports both shapes we encounter.
     """
     # Shape A: list[ { key, bookmakers: [ { key, markets: [ { key, outcomes } ] } ] } ]
     if isinstance(event_odds, list):
@@ -193,7 +196,6 @@ def build_rows(date: str, games: List[Dict[str, Any]]) -> List[DKRow]:
         try:
             props = fetch_props_for_event(event_id)
         except requests.HTTPError as e:
-            # 422 often means market missing for this event -- warn and continue
             st.warning(f"Props fetch failed for {gid}: {e}")
             time.sleep(0.15)
             continue
@@ -259,7 +261,7 @@ def run(date: str) -> Tuple[str, str]:
     odds_path = f"dk_markets_{date}.csv"
     write_csv(odds_path, rows)
 
-    # 2) Features CSV (weather, park, opp, bullpen)
+    # 2) Features CSV (weather, park, opp, bullpen, pitcher_form via feature_builder)
     from etl.feature_builder import build_features
     try:
         dk_df = pd.read_csv(odds_path)
@@ -267,14 +269,13 @@ def run(date: str) -> Tuple[str, str]:
         feat_path = f"features_{date}.csv"
         feats.to_csv(feat_path, index=False)
     except Exception as e:
-        # Fail-safe: write an empty skeleton so the app can proceed
         st.warning(f"Feature build failed, writing skeleton features: {e}")
         feat_path = f"features_{date}.csv"
         pd.DataFrame(columns=["player_id"]).to_csv(feat_path, index=False)
 
     return odds_path, feat_path
 
-# Allow running from CLI for quick tests on Streamlit Cloud shell
+# Allow running from CLI
 if __name__ == "__main__":
     today = dt.date.today().strftime("%Y-%m-%d")
     o, f = run(today)
