@@ -25,10 +25,11 @@ def _abbr(tok: str) -> str:
 def _matchup(gid: str) -> str:
     try:
         p = gid.split("-")
-        home = _abbr(_tok(p[1])); away = _abbr(_tok(p[2]))
+        home = _abbr(_tok(p[-2]))  # ← last two tokens are teams
+        away = _abbr(_tok(p[-1]))
         return f"{away}@{home}"
     except Exception:
-        return ""
+        return "???@???"
 
 def describe_row(r: pd.Series) -> str:
     mt   = str(r.get("market_type",""))
@@ -45,7 +46,7 @@ def describe_row(r: pd.Series) -> str:
         team = _abbr(_tok(str(r.get("team",""))))
         try:
             ln = float(line)
-            ln_txt = f"{ln:+.1f}" if abs(ln) != 1.0 else f"{ln:+.1f}"
+            ln_txt = f"{ln:+.1f}"
         except Exception:
             ln_txt = str(line)
         return f"{team} {ln_txt} ({m})"
