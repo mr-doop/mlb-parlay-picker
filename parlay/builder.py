@@ -1,13 +1,11 @@
 # parlay/builder.py
 from __future__ import annotations
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Set
 import numpy as np
 import pandas as pd
-
 from .odds import american_to_decimal
 
-# ---- helpers ---------------------------------------------------------
-
+# ---------- odds helpers ----------
 def _combo_decimal(legs: List[pd.Series]) -> float:
     dec = 1.0
     for r in legs:
@@ -22,90 +20,86 @@ def _combo_q_independent(legs: List[pd.Series]) -> float:
     return q
 
 def _score_row(r: pd.Series, weight_ev: float = 0.5) -> float:
-    # blend safety and value
-    q = float(r.get("q_model", r.get("p_market", 0.5)))
+    q  = float(r.get("q_model", r.get("p_market", 0.5)))
     ev = float(r.get("ev", 0.0))
     return q + weight_ev * max(ev, 0.0)
 
-def _diversify_mask(df: pd.DataFrame, chosen: List[pd.Series]) -> pd.Series:
-    if not chosen: return pd.Series([True]*len(df), index=df.index)
-    used_players = {str(r.get("player_id","")) for r in chosen if pd.notna(r.get("player_id"))}
-    used_games   = {str(r.get("game_id","")) for r in chosen if pd.notna(r.get("game_id"))}
-    used_types   = {str(r.get("market_type","")) for r in chosen if pd.notna(r.get("market_type"))}
+def _sig(r: pd.Series) -> Tuple:
+    return (str(r.get("player_id","")), str(r.get("market_type","")), str(r.get("side","")),
+            float(r.get("alt_line", np.nan)), str(r.get("game_id","")))
 
+def _diversify_mask(df: pd.DataFrame, chosen: List[pd.Series], used_global: Set[Tuple]) -> pd.Series:
+    if not chosen and not used_global:
+        return pd.Series(True, index=df.index)
     m = pd.Series(True, index=df.index)
-    if used_players: m &= ~df["player_id"].astype(str).isin(used_players)
-    if used_games:   m &= ~df["game_id"].astype(str).isin(used_games)
-    # allow duplicates in type but not all same; cap to <= legs/2
-    for t in used_types:
-        cap = max(1, len(chosen)//2)
-        if sum(1 for r in chosen if str(r.get("market_type",""))==t) >= cap:
-            m &= (df["market_type"] != t)
+    # Avoid reusing exact same leg (across tiers)
+    if used_global:
+        m &= ~df.apply(lambda r: _sig(r) in used_global, axis=1)
+    # Avoid same player and same game inside a single card
+    if chosen:
+        used_players = {str(r.get("player_id","")) for r in chosen}
+        used_games   = {str(r.get("game_id","")) for r in chosen}
+        if "player_id" in df: m &= ~df["player_id"].astype(str).isin(used_players)
+        if "game_id"   in df: m &= ~df["game_id"].astype(str).isin(used_games)
+        # cap dominant market type
+        used_types = {str(r.get("market_type","")) for r in chosen}
+        for t in used_types:
+            cap = max(1, len(chosen)//2)
+            if sum(1 for r in chosen if str(r.get("market_type",""))==t) >= cap:
+                m &= (df["market_type"] != t)
     return m
 
-def _pick_greedy(pool: pd.DataFrame, legs: int, weight_ev: float) -> List[pd.Series]:
+def _pick_greedy(pool: pd.DataFrame, legs: int, weight_ev: float, used_global: Set[Tuple]) -> List[pd.Series]:
     picks: List[pd.Series] = []
     df = pool.copy()
     while len(picks) < legs and not df.empty:
-        mask = _diversify_mask(df, picks)
+        mask = _diversify_mask(df, picks, used_global)
         cand = df[mask].copy()
         if cand.empty:
-            cand = df.copy()  # relax diversification if needed
+            cand = df.copy()  # relax if too strict
         cand["__score"] = cand.apply(_score_row, axis=1, weight_ev=weight_ev)
         best_idx = cand.sort_values(["__score","q_model","decimal_odds"], ascending=[False,False,False]).index[0]
         picks.append(df.loc[best_idx])
+        used_global.add(_sig(df.loc[best_idx]))
         df = df.drop(index=[best_idx])
     return picks
 
 def _pool_for_tier(df: pd.DataFrame, tier: str) -> pd.DataFrame:
     d = df.copy()
-    if tier == "Low":
-        # safer: high q, usually negative odds
-        return d[(d["q_model"] >= 0.70) & (d["american_odds"] <= -100)]
-    if tier == "Medium":
-        # balance: decent q, allow mix; ensure not all heavy favorites
-        return d[(d["q_model"] >= 0.62)]
-    if tier == "High":
-        # value hunting: allow more +money, but keep q >= 0.55
-        return d[(d["q_model"] >= 0.55)]
+    if tier == "Low":    return d[(d["q_model"] >= 0.70) & (d["american_odds"] <= -100)]
+    if tier == "Medium": return d[(d["q_model"] >= 0.62)]
+    if tier == "High":   return d[(d["q_model"] >= 0.55)]
     return d
 
-def build_presets(pool: pd.DataFrame, legs_list=(4,5,6,8), min_parlay_am="+600") -> Dict[Tuple[int,str], Dict]:
-    """
-    Returns dict keyed by (legs, tier) with:
-      { "legs": [rows], "decimal": float, "q_est": float, "meets_min": bool, "label": str }
-    """
-    # compute decimal odds if missing
-    if "decimal_odds" not in pool.columns:
-        pool = pool.copy()
-        pool["decimal_odds"] = pool["american_odds"].apply(lambda x: american_to_decimal(int(x)))
+def build_presets(pool: pd.DataFrame, legs_list=(4,5,6,8), min_parlay_am="+600",
+                  odds_min=None, odds_max=None) -> Dict[Tuple[int,str], Dict]:
+    # odds range filter
+    df = pool.copy()
+    if odds_min is not None and odds_max is not None:
+        df = df[(df["american_odds"] >= odds_min) & (df["american_odds"] <= odds_max)]
+    if "decimal_odds" not in df.columns:
+        df["decimal_odds"] = df["american_odds"].apply(lambda x: american_to_decimal(int(x)))
 
-    # minimum parlay decimal given American +600:
-    min_dec = 1 + (abs(int(min_parlay_am.replace("+",""))) / 100.0)  # 7.0
-
+    min_dec = 1 + (abs(int(str(min_parlay_am).replace("+",""))) / 100.0)  # +600 => 7.0
     out: Dict[Tuple[int,str], Dict] = {}
-    # keep track of picks used so tiers differ
-    used_global = set()
+    used_global: Set[Tuple] = set()
 
     for legs in legs_list:
         for tier, w in [("Low", 0.25), ("Medium", 0.50), ("High", 0.80)]:
-            pool_t = _pool_for_tier(pool, tier).copy()
+            pool_t = _pool_for_tier(df, tier).copy()
             if pool_t.empty:
-                out[(legs,tier)] = {"legs": [], "decimal": 1.0, "q_est": 0.0, "meets_min": False, "label": f"{tier}"}
+                out[(legs,tier)] = {"legs": [], "decimal": 1.0, "q_est": 0.0, "meets_min": False, "label": tier}
                 continue
-
-            # de-duplicate globally so Medium/High aren't identical to Low
-            pool_t = pool_t[~pool_t.index.isin(list(used_global))].copy() if used_global else pool_t
-
-            picks = _pick_greedy(pool_t, legs, weight_ev=w)
+            picks = _pick_greedy(pool_t, legs, weight_ev=w, used_global=used_global)
             if not picks:
-                out[(legs,tier)] = {"legs": [], "decimal": 1.0, "q_est": 0.0, "meets_min": False, "label": f"{tier}"}
+                out[(legs,tier)] = {"legs": [], "decimal": 1.0, "q_est": 0.0, "meets_min": False, "label": tier}
                 continue
-
-            for p in picks:
-                used_global.add(p.name)
-
             dec = _combo_decimal(picks)
             q   = _combo_q_independent(picks)
             out[(legs,tier)] = {"legs": picks, "decimal": dec, "q_est": q, "meets_min": (dec >= min_dec), "label": tier}
     return out
+
+def build_one_tap(pool: pd.DataFrame, legs: int, risk: str, odds_min=None, odds_max=None) -> Dict:
+    # risk in {"Low","Medium","High"}
+    return build_presets(pool, legs_list=(legs,), min_parlay_am="+600",
+                         odds_min=odds_min, odds_max=odds_max)[(legs, risk)]
