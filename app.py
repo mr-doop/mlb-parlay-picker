@@ -241,7 +241,7 @@ with tab2:
     # Start from globally filtered pool, then dedupe identical legs
     top_base = dedupe_legs(pool)
 
-    # Hard floor for Top-20 regardless of global slider
+    # Hard floor for Top-20 regardless of slider
     min_top_odds = max(min_american, -350)
     top = top_base[(top_base["american_odds"] >= min_top_odds) & (top_base["q_model"] >= 0.60)].copy()
 
@@ -257,30 +257,45 @@ with tab2:
                 f"- **Odds**: {int(r['american_odds'])} | **Model q**: {r['q_model']:.1%} | "
                 f"**Market**: {r['p_market']:.1%} | **Edge**: {r['edge']:+.1%} | **EV**: {r['ev']:+.2f}"
             )
-            # Player-specific notes (now unique because pitcher_form feeds expected_ip, mu_ks, mu_bb)
+
+            # Compact, player-specific notes
             notes = []
             mt = str(r.get("market_type",""))
-            if mt == "PITCHER_KS" and pd.notna(r.get("mu_ks", np.nan)):
-                notes.append(f"Ks μ≈{r['mu_ks']:.2f} vs line {r.get('alt_line')}.")
-            if mt == "PITCHER_OUTS" and pd.notna(r.get("expected_ip", np.nan)):
-                notes.append(f"Expected IP≈{r['expected_ip']:.2f} (outs mean≈{r['expected_ip']*3:.1f}) vs line {r.get('alt_line')}.")
-            if mt == "PITCHER_WALKS" and pd.notna(r.get("mu_bb", np.nan)):
-                notes.append(f"Walks μ≈{r['mu_bb']:.2f} vs line {r.get('alt_line')}.")
 
-            # Context signals (these vary by game/park/weather/opp)
-            if pd.notna(r.get("park_k_factor", np.nan)):
-                notes.append(f"Park K factor {r['park_k_factor']:.2f}.")
-            if pd.notna(r.get("run_env_delta", np.nan)) and abs(r["run_env_delta"]) >= 0.02:
-                notes.append(("Run env +" if r["run_env_delta"]>0 else "Run env −") + f"{abs(r['run_env_delta']):.2f}.")
-            if pd.notna(r.get("opp_k_rate", np.nan)):
-                notes.append(f"Opp K% {r['opp_k_rate']:.0%}, BB% {r.get('opp_bb_rate', np.nan):.0%}.")
-            if pd.notna(r.get("last5_pc_mean", np.nan)):
-                notes.append(f"Last5 pitch ct ≈{r['last5_pc_mean']:.0f}; rest {r.get('days_rest', np.nan):.0f}d.")
+            # OUTS
+            if mt == "PITCHER_OUTS" and pd.notna(r.get("expected_ip", np.nan)):
+                ip = float(r["expected_ip"])
+                outs_mean = int(round(ip * 3))
+                notes.append(f"Exp IP: {ip:.1f} (O:{outs_mean}) vs Ln: {r.get('alt_line')}")
+
+            # KS
+            if mt == "PITCHER_KS" and pd.notna(r.get("mu_ks", np.nan)):
+                notes.append(f"μK: {float(r['mu_ks']):.2f} vs Ln: {r.get('alt_line')}")
+
+            # WALKS
+            if mt == "PITCHER_WALKS" and pd.notna(r.get("mu_bb", np.nan)):
+                notes.append(f"μBB: {float(r['mu_bb']):.2f} vs Ln: {r.get('alt_line')}")
+
+            # Context signals (these vary by game/park/opp)
+            pk  = r.get("park_k_factor", np.nan)
+            okr = r.get("opp_k_rate", np.nan)
+            obr = r.get("opp_bb_rate", np.nan)
+            l5  = r.get("last5_pc_mean", np.nan)
+            rest = r.get("days_rest", np.nan)
+
+            meta = []
+            if pd.notna(pk):   meta.append(f"ParkK {float(pk):.2f}")
+            if pd.notna(okr):  meta.append(f"OppK {float(okr):.0%}")
+            if pd.notna(obr):  meta.append(f"OppBB {float(obr):.0%}")
+            if pd.notna(l5):   meta.append(f"L5PC {float(l5):.0f}")
+            if pd.notna(rest): meta.append(f"Rest {float(rest):.0f}d")
+            if meta:
+                notes.append(" • ".join(meta))
 
             if not notes:
                 notes.append("Ranked by EV blending projections with payout.")
 
-            st.caption(" ".join(notes))
+            st.caption("  ".join(notes))
 
 # ---------------------------------- Parlay Presets (exact 4, 5, 6, 8 legs; Low/Med/High)
 with tab3:
