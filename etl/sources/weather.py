@@ -1,16 +1,25 @@
 # etl/sources/weather.py
 # Weather + roof inference for MLB ballparks via Open-Meteo (no API key).
-# Produces per-game features keyed by game_id.
+# Produces per-game features keyed by game_id, broadcast to player_id.
 
-import math, requests, datetime as dt
-from typing import Dict, List
+import math, requests, datetime as dt, re
+from typing import Dict
 import pandas as pd
 
+def _team_key(s: str) -> str:
+    return re.sub(r'[^A-Za-z]', '', s or '')
+
+def _home_from_gid(game_id: str) -> str:
+    # "YYYY-MM-DD-Home-Away"
+    try:
+        return _team_key(game_id.split("-")[1])
+    except Exception:
+        return ""
+
 # Minimal ballpark map (lat, lon, CF bearing in degrees, roof=True/False)
-# Keys match the "home" token in your game_id: YYYY-MM-DD-HomeTeamNoSpaces-AwayTeamNoSpaces
 BALLPARKS: Dict[str, Dict] = {
-    "ArizonaDiamondbacks":      {"lat":33.4457,"lon":-112.0667,"cf_bearing": 17, "roof": True},   # Chase
-    "AtlantaBraves":            {"lat":33.8907,"lon":-84.4677, "cf_bearing": 25, "roof": False},  # Truist
+    "ArizonaDiamondbacks":      {"lat":33.4457,"lon":-112.0667,"cf_bearing": 17, "roof": True},
+    "AtlantaBraves":            {"lat":33.8907,"lon":-84.4677, "cf_bearing": 25, "roof": False},
     "BaltimoreOrioles":         {"lat":39.2840,"lon":-76.6216, "cf_bearing":  8, "roof": False},
     "BostonRedSox":             {"lat":42.3467,"lon":-71.0972, "cf_bearing": 15, "roof": False},
     "ChicagoCubs":              {"lat":41.9484,"lon":-87.6553, "cf_bearing":  6, "roof": False},
@@ -41,25 +50,6 @@ BALLPARKS: Dict[str, Dict] = {
     "WashingtonNationals":      {"lat":38.8730,"lon":-77.0074, "cf_bearing":  7, "roof": False},
 }
 
-def _home_from_gid(game_id: str) -> str:
-    # "YYYY-MM-DD-Home-Away"
-    try:
-        return game_id.split("-")[1]
-    except Exception:
-        return ""
-
-def _haversine(a, b):
-    R=6371.0; from math import radians, sin, cos, asin, sqrt
-    lat1,lon1=a; lat2,lon2=b
-    dlat=radians(lat2-lat1); dlon=radians(lon2-lon1)
-    x=sin(dlat/2)**2+cos(radians(lat1))*cos(radians(lat2))*sin(dlon/2)**2
-    return 2*R*asin(sqrt(x))
-
-def _angle_delta(a, b):
-    # minimal distance between two bearings, degrees (0..180)
-    d = abs((a - b + 180) % 360 - 180)
-    return d
-
 def _fetch_hourly(lat: float, lon: float, date: str) -> pd.DataFrame:
     url = "https://api.open-meteo.com/v1/forecast"
     params = dict(
@@ -77,29 +67,26 @@ def _fetch_hourly(lat: float, lon: float, date: str) -> pd.DataFrame:
     return df
 
 def _choose_game_hour(df_hourly: pd.DataFrame) -> pd.Series:
-    # pick 7pm local if present, else nearest to 7pm
     if df_hourly.empty: return pd.Series(dtype=float)
-    target = df_hourly["time"].dt.normalize() + pd.Timedelta(hours=19)
-    # handle timezones by per-row comparison (same date)
+    target = df_hourly["time"].dt.normalize() + pd.Timedelta(hours=19)  # ~7pm local
     idx = (df_hourly["time"] - target).abs().idxmin()
     return df_hourly.loc[idx]
 
 def build(date: str, dk_df: pd.DataFrame) -> pd.DataFrame:
     """Return per-player features derived from per-game weather/roof."""
-    # map each player_id -> game_id for broadcasting game-level weather
     m = dk_df[dk_df["player_id"].notna()][["player_id","game_id"]].drop_duplicates()
     if m.empty:
-        return pd.DataFrame(columns=["player_id","temp_f","humidity","pressure_mb","wind_speed_mph",
-                                     "wind_deg","wind_out_to_cf","roof_closed","air_density_index",
-                                     "run_env_delta"])
-    # compute weather per game
+        return pd.DataFrame(columns=[
+            "player_id","temp_f","humidity","pressure_mb","wind_speed_mph",
+            "wind_deg","wind_out_to_cf","roof_closed","air_density_index","run_env_delta"
+        ])
+
     games = sorted(m["game_id"].unique().tolist())
     rows = []
     for gid in games:
         home = _home_from_gid(gid)
         park = BALLPARKS.get(home)
         if not park:
-            # unknown park -> neutral
             rows.append(dict(game_id=gid, temp_f=70.0, humidity=50.0, pressure_mb=1015.0,
                              wind_speed_mph=0.0, wind_deg=0.0, wind_out_to_cf=0,
                              roof_closed=0, air_density_index=0.0, run_env_delta=0.0))
@@ -120,26 +107,16 @@ def build(date: str, dk_df: pd.DataFrame) -> pd.DataFrame:
         except Exception:
             temp_f, humidity, pressure_mb, wind_speed_mph, wind_deg = 70.0, 50.0, 1015.0, 0.0, 0.0
 
-        # simple "wind out" flag based on CF bearing
-        out_flag = 1 if _angle_delta(wind_deg, cf) <= 40 and wind_speed_mph >= 8 else 0
-
-        # crude roof heuristic
+        out_flag = 1 if (abs(((wind_deg - cf + 180) % 360) - 180) <= 40 and wind_speed_mph >= 8) else 0
         roof_closed = 1 if roof and (temp_f >= 88 or humidity >= 65 or wind_speed_mph >= 14) else 0
-
-        # composite air density index (lower density -> ball carries -> run env +)
-        adi = ( (temp_f-70)/30.0 ) + (humidity-50)/100.0 + (wind_speed_mph/20.0)*(1 if out_flag else -0.2)
-        if roof_closed: adi = 0.0  # neutralize if roof closed
-
-        # map to run environment delta (-.3 .. +.3 typical)
+        adi = ((temp_f-70)/30.0) + (humidity-50)/100.0 + (wind_speed_mph/20.0)*(1 if out_flag else -0.2)
+        if roof_closed: adi = 0.0
         run_env_delta = max(-0.35, min(0.35, 0.10*(temp_f-70)/10 + 0.12*out_flag + 0.08*(humidity-50)/25))
 
         rows.append(dict(game_id=gid, temp_f=temp_f, humidity=humidity, pressure_mb=pressure_mb,
-                         wind_speed_mph=wind_speed_mph, wind_deg=wind_deg,
-                         wind_out_to_cf=out_flag, roof_closed=roof_closed,
-                         air_density_index=adi, run_env_delta=run_env_delta))
+                         wind_speed_mph=wind_speed_mph, wind_deg=wind_deg, wind_out_to_cf=out_flag,
+                         roof_closed=roof_closed, air_density_index=adi, run_env_delta=run_env_delta))
 
     gdf = pd.DataFrame(rows)
-
-    # broadcast to player_id
     out = m.merge(gdf, on="game_id", how="left").drop(columns=["game_id"])
     return out
