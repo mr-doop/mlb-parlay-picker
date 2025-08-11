@@ -1,18 +1,19 @@
 # etl/sources/opp_rates.py
-# Opponent rolling K% / BB% (tries pybaseball; falls back to league-ish defaults).
+# Opponent K% / BB% (seasonal via pybaseball if available; safe defaults otherwise).
 
 from typing import Optional
 import pandas as pd
+import re
+
+def _team_key(s: str) -> str:
+    return re.sub(r'[^A-Za-z]', '', s or '')
 
 def _try_pybaseball_fetch() -> Optional[pd.DataFrame]:
     try:
         from pybaseball import team_batting
-        # team_batting(season) gives seasonal; for MVP we use that if rolling not available
-        # (Rolling 14/30 would require aggregations on game logs; keep simple here.)
         import datetime as dt
         year = dt.date.today().year
         tb = team_batting(year)
-        # normalize columns
         tb = tb.rename(columns={"Team":"team","SO%":"K%","BB%":"BB%"})
         tb["team"] = tb["team"].astype(str)
         tb["K%"] = pd.to_numeric(tb["K%"], errors="coerce")/100.0
@@ -21,8 +22,8 @@ def _try_pybaseball_fetch() -> Optional[pd.DataFrame]:
     except Exception:
         return None
 
+# Map sanitized tokens used in game_id to pybaseball team names
 TEAM_MAP = {
-    # map DK concat team tokens to readable team names used by pybaseball when possible
     "ArizonaDiamondbacks":"Arizona Diamondbacks",
     "AtlantaBraves":"Atlanta Braves",
     "BaltimoreOrioles":"Baltimore Orioles",
@@ -56,9 +57,6 @@ TEAM_MAP = {
 }
 
 def build(date: str, dk_df: pd.DataFrame) -> pd.DataFrame:
-    # target: per-player opponent rates, but we don’t have pitcher->team.
-    # So we attach opponent rates by game_id to BOTH pitchers in that game.
-    # For MVP we’ll just broadcast league-ish defaults if we can’t resolve names.
     tb = _try_pybaseball_fetch()
     defaults = {"opp_k_rate":0.22, "opp_bb_rate":0.08}
 
@@ -66,17 +64,18 @@ def build(date: str, dk_df: pd.DataFrame) -> pd.DataFrame:
     if m.empty:
         return pd.DataFrame(columns=["player_id","opp_k_rate","opp_bb_rate"])
 
-    # Parse home/away from game_id
-    def parts(gid): 
+    def parts(gid):
         try:
-            p = gid.split("-"); return p[1], p[2]
+            p = gid.split("-")
+            return _team_key(p[1]), _team_key(p[2])
         except Exception:
             return "", ""
+
     m[["home_key","away_key"]] = m["game_id"].map(lambda g: pd.Series(parts(g)))
 
-    # Try to map to team names used by pybaseball & attach their seasonal K/BB
     if tb is not None:
         name_to_rates = tb.set_index("team")[["K%","BB%"]].to_dict("index")
+
         def get_rates(key):
             team_name = TEAM_MAP.get(key, None)
             if team_name and team_name in name_to_rates:
@@ -84,14 +83,16 @@ def build(date: str, dk_df: pd.DataFrame) -> pd.DataFrame:
                 return d["K%"], d["BB%"]
             return defaults["opp_k_rate"], defaults["opp_bb_rate"]
 
-        # For pitchers on the HOME team, their opponent is AWAY, and vice versa.
-        # We don’t know pitcher team here, so broadcast the MEAN of home+away opponent rates.
         rates = []
         for _, row in m.iterrows():
             k1, b1 = get_rates(row["home_key"])
             k2, b2 = get_rates(row["away_key"])
-            rates.append({"player_id":row["player_id"], "opp_k_rate": (k1+k2)/2.0, "opp_bb_rate":(b1+b2)/2.0})
+            rates.append({"player_id":row["player_id"],
+                          "opp_k_rate": (k1+k2)/2.0,
+                          "opp_bb_rate": (b1+b2)/2.0})
         out = pd.DataFrame(rates)
     else:
-        out = m.assign(opp_k_rate=defaults["opp_k_rate"], opp_bb_rate=defaults["opp_bb_rate"]).drop(columns=["game_id","home_key","away_key"])
+        out = m.assign(opp_k_rate=defaults["opp_k_rate"], opp_bb_rate=defaults["opp_bb_rate"]) \
+               .drop(columns=["game_id","home_key","away_key"])
+
     return out
