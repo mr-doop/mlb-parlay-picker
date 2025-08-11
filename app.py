@@ -317,55 +317,60 @@ with tab3:
     st.dataframe(parlays_tbl, use_container_width=True, hide_index=True)
 
 # ---------------------------------- ML Winners & Alt RL Locks
-with tab4:
-    st.markdown('<div class="block-title">Moneyline Winners (by game)</div>', unsafe_allow_html=True)
-    ml = pool[pool["category"]=="Moneyline"].copy()
-    # pick the side with highest model probability per game
+with tab4:  # <-- if your tabs are named differently, use the right one here
+    st.markdown('<div class="block-title">ML Winners & Alt RL Locks</div>', unsafe_allow_html=True)
+
+    # ---- Moneyline winners (pick the higher model q per game)
+    ml = pool[pool["market_type"] == "MONEYLINE"].copy()
     if ml.empty:
         st.info("No moneyline markets in the current pool.")
     else:
-        ml_best = (ml.sort_values(["game_id","q_model","ev"], ascending=[True,False,False])
-                      .groupby("game_id", as_index=False).head(1))
-        ml_best["ML Lock?"] = ml_best["q_model"] >= 0.65   # strong ML confidence threshold
-# Existing code picks ml_best...
-ml_disp = add_pct_cols(ml_best[[
-    "game_id","side","team","american_odds","decimal_odds","q_model","p_market","edge","ev","description","ML Lock?"
-]])
-ml_show = ["game_id","team","side","american_odds","decimal_odds","Model q %","Market %","Edge %","ev","ML Lock?","description"]
+        ml_best = (
+            ml.sort_values(["q_model","ev"], ascending=[False, False])
+              .drop_duplicates(subset=["game_id"], keep="first")
+              .copy()
+        )
+        ml_best["ML Lock?"] = (ml_best["q_model"] >= 0.65)
 
-# FIX: sort before slicing so 'q_model' exists in the object we sort
-ml_sorted = ml_disp.sort_values(["ML Lock?","q_model","ev"], ascending=[False,False,False])
-st.dataframe(ml_sorted[ml_show], use_container_width=True, hide_index=True, column_config=colcfg)
+        ml_disp = add_pct_cols(ml_best[[
+            "game_id","team","side","american_odds","decimal_odds",
+            "q_model","p_market","edge","ev","description","ML Lock?"
+        ]])
+
+        # sort before slicing to display columns
+        ml_sorted = ml_disp.sort_values(["ML Lock?","q_model","ev"], ascending=[False, False, False])
+        ml_show = ["game_id","team","side","american_odds","decimal_odds",
+                   "Model q %","Market %","Edge %","ev","ML Lock?","description"]
+
+        st.dataframe(
+            ml_sorted[ml_show],
+            use_container_width=True,
+            hide_index=True,
+            column_config=colcfg
+        )
         st.caption("Picks are the most probable moneyline side in each game (model q). ML Lock? = q ≥ 65%.")
 
-    st.markdown('<div class="block-title" style="margin-top:10px;">Alternate Run Line -- Strong Candidates</div>', unsafe_allow_html=True)
-    arl = pool[pool["category"]=="Run Line"].copy()
+    # ---- Alt Run Line locks (RUN_LINE or ALT_RUN_LINE with high q)
+    arl = pool[pool["market_type"].isin(["ALT_RUN_LINE","RUN_LINE"])].copy()
     if arl.empty:
-        st.info("No run line markets in the current pool.")
+        st.info("No run line markets found.")
     else:
-        # top ARL per game by model prob (favor safer alt lines automatically if offered)
-        arl_best = (arl.sort_values(["game_id","q_model","ev"], ascending=[True,False,False])
-                       .groupby("game_id", as_index=False).head(1))
-        arl_best["ARL Lock?"] = arl_best["q_model"] >= 0.70
-        arl_disp = add_pct_cols(arl_best[[
-            "game_id","team","side","alt_line","american_odds","decimal_odds","q_model","p_market","edge","ev","description","ARL Lock?"
-        ]])
-        arl_show = ["game_id","team","side","alt_line","american_odds","decimal_odds","Model q %","Market %","Edge %","ev","ARL Lock?","description"]
-        st.dataframe(arl_disp[arl_show].sort_values(["ARL Lock?","q_model","ev"], ascending=[False,False,False]),
-                     use_container_width=True, hide_index=True, column_config=colcfg)
-        st.caption("Strong ARL candidates: best run line per game by model q (ARL Lock? = q ≥ 70%).")
+        arl_locks = arl[arl["q_model"] >= 0.70].copy()
+        if arl_locks.empty:
+            st.info("No Alt RL locks ≥ 70% by the model.")
+        else:
+            arl_disp = add_pct_cols(arl_locks[[
+                "game_id","team","alt_line","american_odds","decimal_odds",
+                "q_model","p_market","edge","ev","description"
+            ]])
+            arl_sorted = arl_disp.sort_values(["q_model","ev"], ascending=[False, False])
+            arl_show = ["game_id","team","alt_line","american_odds","decimal_odds",
+                        "Model q %","Market %","Edge %","ev","description"]
 
-# ---------------------------------- Locks (≥85%)
-with tab5:
-    st.markdown('<div class="block-title">Locks (model ≥ 85% to hit)</div>', unsafe_allow_html=True)
-    locks = pool[pool["q_model"] >= 0.85].copy().sort_values(["q_model","edge"], ascending=[False,False]).head(20)
-    if locks.empty:
-        st.info("No 85%+ locks under current filters.")
-    else:
-        locks_disp = add_pct_cols(locks[[
-            "category","description","american_odds","decimal_odds","q_model","p_market","edge","ev"
-        ]])
-        lock_show = ["category","description","american_odds","decimal_odds","Model q %","Market %","Edge %","ev"]
-        st.dataframe(locks_disp[lock_show],
-                     use_container_width=True, hide_index=True, column_config=colcfg)
-        st.caption("Reminder: correlations and late news can change true hit rates. Use responsibly.")
+            st.dataframe(
+                arl_sorted[arl_show],
+                use_container_width=True,
+                hide_index=True,
+                column_config=colcfg
+            )
+            st.caption("Alt run line locks use model q ≥ 70%.")
