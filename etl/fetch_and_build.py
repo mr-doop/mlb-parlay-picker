@@ -9,10 +9,12 @@ ROOT = "https://api.the-odds-api.com/v4"
 # We pull game odds first (h2h, spreads), then per-event props (Ks/Outs/Walks/Win)
 GAME_MARKETS = "h2h,spreads"
 PROP_MARKETS = ",".join([
-    "player_pitcher_strikeouts",
-    "player_pitcher_outs",
-    "player_pitcher_walks",
-    "player_pitcher_to_record_a_win"
+    "pitcher_strikeouts",
+    "pitcher_strikeouts_alternate",  # alt lines (X+)
+    "pitcher_outs",
+    "pitcher_walks",
+    "pitcher_walks_alternate",       # alt lines (X+)
+    "pitcher_record_a_win"
 ])
 
 @dataclass
