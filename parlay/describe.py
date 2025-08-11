@@ -1,6 +1,4 @@
 # parlay/describe.py
-# Build short, readable row descriptions using team abbreviations.
-
 from __future__ import annotations
 import re
 import pandas as pd
@@ -16,20 +14,22 @@ ABBR = {
     "TorontoBlueJays":"TOR","WashingtonNationals":"WSH"
 }
 
-def _tok(s: str) -> str:
-    return re.sub(r'[^A-Za-z]', '', s or '')
+def _tok(s: str) -> str: return re.sub(r'[^A-Za-z]', '', s or '')
+def _abbr(tok: str) -> str: return ABBR.get(tok, (tok[:3] or "???").upper())
 
-def _abbr(tok: str) -> str:
-    return ABBR.get(tok, (tok[:3] or "???").upper())
-
-def _matchup(gid: str) -> str:
+def matchup(gid: str) -> str:
     try:
         p = gid.split("-")
-        home = _abbr(_tok(p[-2]))  # ← last two tokens are teams
-        away = _abbr(_tok(p[-1]))
+        home = _abbr(_tok(p[-2])); away = _abbr(_tok(p[-1]))
         return f"{away}@{home}"
     except Exception:
         return "???@???"
+
+def compact_player(name: str) -> str:
+    parts = [p for p in name.replace(".", "").split(" ") if p]
+    if not parts: return name
+    if len(parts) == 1: return parts[0]
+    return f"{parts[0][0]}. {parts[-1]}"
 
 def describe_row(r: pd.Series) -> str:
     mt   = str(r.get("market_type",""))
@@ -37,25 +37,25 @@ def describe_row(r: pd.Series) -> str:
     line = r.get("alt_line","")
     name = str(r.get("player_name","")).strip()
     gid  = r.get("game_id","")
-    m    = _matchup(gid)
+    m    = matchup(gid)
 
     if mt == "MONEYLINE":
         team = _abbr(_tok(str(r.get("team",""))))
         return f"{team} ML ({m})"
+
     if mt in ("RUN_LINE","ALT_RUN_LINE"):
         team = _abbr(_tok(str(r.get("team",""))))
-        try:
-            ln = float(line)
-            ln_txt = f"{ln:+.1f}"
-        except Exception:
-            ln_txt = str(line)
+        try: ln = float(line); ln_txt = f"{ln:+.1f}"
+        except Exception: ln_txt = str(line)
         return f"{team} {ln_txt} ({m})"
+
     if mt == "PITCHER_KS":
-        return f"{name} Ks {side} {line} ({m})"
+        return f"{compact_player(name)} ({m.split('@')[1]}) {('O' if side=='OVER' else 'U')}{line} Ks"
     if mt == "PITCHER_OUTS":
-        return f"{name} Outs {side} {line} ({m})"
+        return f"{compact_player(name)} ({m.split('@')[1]}) {('O' if side=='OVER' else 'U')}{line} Outs"
     if mt == "PITCHER_WALKS":
-        return f"{name} BB {side} {line} ({m})"
+        return f"{compact_player(name)} ({m.split('@')[1]}) {('O' if side=='OVER' else 'U')}{line} BB"
     if mt == "PITCHER_WIN":
-        return f"{name} To Win -- {side} ({m})"
+        return f"{compact_player(name)} ({m.split('@')[1]}) Win {side}"
+
     return f"{mt} -- {side} {line} ({m})"
