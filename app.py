@@ -11,6 +11,18 @@ from parlay.builder import build_parlay_greedy
 from parlay.describe import describe_row
 from parlay.projections import apply_projections  # enables q_proj when features uploaded
 
+def dedupe_legs(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop duplicate legs (same market/player/side/line/game)."""
+    if df.empty:
+        return df
+    keep_cols = ["market_type","player_id","side","alt_line","game_id"]
+    tmp = df.copy()
+    # make sure alt_line comparable as string for uniqueness
+    tmp["alt_line"] = tmp["alt_line"].astype(str)
+    return (tmp
+            .sort_values(["q_model","edge","ev"], ascending=[False,False,False])
+            .drop_duplicates(subset=keep_cols, keep="first"))
+
 st.set_page_config(page_title="MLB Parlay Picker -- MVP", layout="wide")
 st.markdown("""
 <style>
@@ -224,42 +236,51 @@ with tab1:
 
 # ---------------------------------- Top 20 Bets
 with tab2:
-    st.markdown('<div class="block-title">Top 20 Bets (≥60% hit, odds ≥ −350, ranked by EV)</div>', unsafe_allow_html=True)
-    top = pool.copy()
-    min_top_odds = max(min_american, -350)          # enforce odds ≥ −350 regardless of a looser global slider
-    top = top[(top["american_odds"] >= min_top_odds) & (top["q_model"] >= 0.60)].copy()
-    top["rank_score"] = top["ev"]
-    top = top.sort_values(["rank_score","q_model","decimal_odds"], ascending=[False,False,False]).head(20)
+    st.markdown('<div class="block-title">Top 20 Bets (≥60% hit, odds ≥ −350, deduped, ranked by EV)</div>', unsafe_allow_html=True)
+
+    # Start from globally filtered pool, then dedupe identical legs
+    top_base = dedupe_legs(pool)
+
+    # Hard floor for Top-20 regardless of global slider
+    min_top_odds = max(min_american, -350)
+    top = top_base[(top_base["american_odds"] >= min_top_odds) & (top_base["q_model"] >= 0.60)].copy()
+
+    # Rank by EV primarily; then by q and payout
+    top = top.sort_values(["ev","q_model","decimal_odds"], ascending=[False,False,False]).head(20)
 
     if top.empty:
-        st.info("No legs meet the ≥60% & odds ≥ −350 threshold under current filters.")
+        st.info("No legs meet ≥60% probability and odds ≥ −350 with current filters.")
     else:
-        # Structured list with written rationale
         for i, (_, r) in enumerate(top.iterrows(), start=1):
             st.markdown(f"**{i}. {r['description']}**")
             st.markdown(
                 f"- **Odds**: {int(r['american_odds'])} | **Model q**: {r['q_model']:.1%} | "
                 f"**Market**: {r['p_market']:.1%} | **Edge**: {r['edge']:+.1%} | **EV**: {r['ev']:+.2f}"
             )
-            blips = []
+            # Player-specific notes (now unique because pitcher_form feeds expected_ip, mu_ks, mu_bb)
+            notes = []
             mt = str(r.get("market_type",""))
             if mt == "PITCHER_KS" and pd.notna(r.get("mu_ks", np.nan)):
-                blips.append(f"Ks μ≈{r['mu_ks']:.2f} vs line {r.get('alt_line')}.")
+                notes.append(f"Ks μ≈{r['mu_ks']:.2f} vs line {r.get('alt_line')}.")
             if mt == "PITCHER_OUTS" and pd.notna(r.get("expected_ip", np.nan)):
-                blips.append(f"Expected IP≈{r['expected_ip']:.2f} (outs mean≈{r['expected_ip']*3:.1f}) vs line {r.get('alt_line')}.")
+                notes.append(f"Expected IP≈{r['expected_ip']:.2f} (outs mean≈{r['expected_ip']*3:.1f}) vs line {r.get('alt_line')}.")
             if mt == "PITCHER_WALKS" and pd.notna(r.get("mu_bb", np.nan)):
-                blips.append(f"Walks μ≈{r['mu_bb']:.2f} vs line {r.get('alt_line')}.")
-            if mt in {"RUN_LINE","ALT_RUN_LINE"} and pd.notna(r.get("alt_line", np.nan)):
-                blips.append(f"Run line {r['alt_line']} chosen for safety/value tradeoff.")
-            if pd.notna(r.get("pitcher_k_rate", np.nan)):
-                blips.append(f"K% {r['pitcher_k_rate']:.0%} vs opp K% {r.get('opp_k_rate', np.nan):.0%}.")
-            if pd.notna(r.get("pitcher_bb_rate", np.nan)):
-                blips.append(f"BB% {r['pitcher_bb_rate']:.0%} vs opp BB% {r.get('opp_bb_rate', np.nan):.0%}.")
-            if pd.notna(r.get("leash_bias", np.nan)) and r["leash_bias"] > 0:
-                blips.append("Longer leash expected.")
-            if not blips:
-                blips.append("Ranked primarily by EV (model q × payout vs market).")
-            st.caption(" ".join(blips))
+                notes.append(f"Walks μ≈{r['mu_bb']:.2f} vs line {r.get('alt_line')}.")
+
+            # Context signals (these vary by game/park/weather/opp)
+            if pd.notna(r.get("park_k_factor", np.nan)):
+                notes.append(f"Park K factor {r['park_k_factor']:.2f}.")
+            if pd.notna(r.get("run_env_delta", np.nan)) and abs(r["run_env_delta"]) >= 0.02:
+                notes.append(("Run env +" if r["run_env_delta"]>0 else "Run env −") + f"{abs(r['run_env_delta']):.2f}.")
+            if pd.notna(r.get("opp_k_rate", np.nan)):
+                notes.append(f"Opp K% {r['opp_k_rate']:.0%}, BB% {r.get('opp_bb_rate', np.nan):.0%}.")
+            if pd.notna(r.get("last5_pc_mean", np.nan)):
+                notes.append(f"Last5 pitch ct ≈{r['last5_pc_mean']:.0f}; rest {r.get('days_rest', np.nan):.0f}d.")
+
+            if not notes:
+                notes.append("Ranked by EV blending projections with payout.")
+
+            st.caption(" ".join(notes))
 
 # ---------------------------------- Parlay Presets (exact 4, 5, 6, 8 legs; Low/Med/High)
 with tab3:
@@ -306,12 +327,15 @@ with tab4:
         ml_best = (ml.sort_values(["game_id","q_model","ev"], ascending=[True,False,False])
                       .groupby("game_id", as_index=False).head(1))
         ml_best["ML Lock?"] = ml_best["q_model"] >= 0.65   # strong ML confidence threshold
-        ml_disp = add_pct_cols(ml_best[[
-            "game_id","side","team","american_odds","decimal_odds","q_model","p_market","edge","ev","description","ML Lock?"
-        ]])
-        ml_show = ["game_id","team","side","american_odds","decimal_odds","Model q %","Market %","Edge %","ev","ML Lock?","description"]
-        st.dataframe(ml_disp[ml_show].sort_values(["ML Lock?","q_model","ev"], ascending=[False,False,False]),
-                     use_container_width=True, hide_index=True, column_config=colcfg)
+# Existing code picks ml_best...
+ml_disp = add_pct_cols(ml_best[[
+    "game_id","side","team","american_odds","decimal_odds","q_model","p_market","edge","ev","description","ML Lock?"
+]])
+ml_show = ["game_id","team","side","american_odds","decimal_odds","Model q %","Market %","Edge %","ev","ML Lock?","description"]
+
+# FIX: sort before slicing so 'q_model' exists in the object we sort
+ml_sorted = ml_disp.sort_values(["ML Lock?","q_model","ev"], ascending=[False,False,False])
+st.dataframe(ml_sorted[ml_show], use_container_width=True, hide_index=True, column_config=colcfg)
         st.caption("Picks are the most probable moneyline side in each game (model q). ML Lock? = q ≥ 65%.")
 
     st.markdown('<div class="block-title" style="margin-top:10px;">Alternate Run Line -- Strong Candidates</div>', unsafe_allow_html=True)
