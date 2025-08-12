@@ -6,6 +6,7 @@ import pandas as pd
 # ---------------- Utilities ----------------
 
 def _player_key(name) -> str:
+    """First initial + last name, lowercase; robust to NaN."""
     if not isinstance(name, (str, np.str_)):
         return ""
     s = name.replace(".", "").strip()
@@ -45,13 +46,35 @@ def _to_float(x):
     except Exception:
         return np.nan
 
+def _series(df: pd.DataFrame, name: str, default=None, dtype=None) -> pd.Series:
+    """Return df[name] if it exists; otherwise a Series of 'default' with same length/index."""
+    if name in df.columns:
+        s = df[name]
+    else:
+        fill = default
+        if fill is None:
+            fill = np.nan
+        s = pd.Series([fill] * len(df), index=df.index)
+    if dtype is not None:
+        try:
+            s = s.astype(dtype)
+        except Exception:
+            pass
+    return s
+
 # ---------------- Public API ----------------
 
 def normalize_features(raw: pd.DataFrame) -> pd.DataFrame:
     """
-    Normalize arbitrary user/auto features into:
-      ['player_key','team_abbr','market_type','side','alt_line','q_proj']
-    q_proj is clipped to [0.01, 0.99].
+    Normalize arbitrary user/auto features into the canonical schema:
+
+        ['player_key','team_abbr','market_type','side','alt_line','q_proj']
+
+    Notes:
+      • Any missing columns are backfilled with safe defaults (empty strings / NaN).
+      • 'q_proj' is required; clipped to [0.01, 0.99].
+      • Accepts aliases: player/name, team/team_code, market/type/bet_type,
+        side/ou/over_under, line/threshold/point, prob/q/probability.
     """
     if raw is None or raw.empty:
         return pd.DataFrame()
@@ -60,39 +83,71 @@ def normalize_features(raw: pd.DataFrame) -> pd.DataFrame:
     df.columns = [c.lower().strip() for c in df.columns]
 
     rename = {
-        "player":"player_name", "name":"player_name",
-        "team":"team_abbr", "team_code":"team_abbr",
-        "market":"market_type", "type":"market_type", "bet_type":"market_type",
-        "side":"side", "ou":"side", "over_under":"side",
-        "line":"alt_line", "threshold":"alt_line", "point":"alt_line",
-        "prob":"q_proj", "q":"q_proj", "probability":"q_proj",
-    }
-    for k, v in rename.items():
-        if k in df.columns and v not in df.columns:
-            df.rename(columns={k: v}, inplace=True)
+        "player": "player_name",
+        "name": "player_name",
 
-    # Derive normalized fields
-    df["player_key"] = df.get("player_name", "").apply(_player_key)
+        "team": "team_abbr",
+        "team_code": "team_abbr",
+
+        "market": "market_type",
+        "type": "market_type",
+        "bet_type": "market_type",
+
+        "side": "side",
+        "ou": "side",
+        "over_under": "side",
+
+        "line": "alt_line",
+        "threshold": "alt_line",
+        "point": "alt_line",
+
+        "prob": "q_proj",
+        "q": "q_proj",
+        "probability": "q_proj",
+    }
+    # Only rename when target not already present
+    for src, dst in rename.items():
+        if src in df.columns and dst not in df.columns:
+            df.rename(columns={src: dst}, inplace=True)
+
+    # ---- Build normalized columns safely ----
+    # player_key from player_name (fallback to empty-string Series so .apply works)
+    names = _series(df, "player_name", default="", dtype="object")
+    df["player_key"] = names.apply(_player_key)
+
+    # team_abbr normalized to 3-letter uppercase
     if "team_abbr" in df.columns:
-        df["team_abbr"] = df["team_abbr"].astype(str).str.upper().str[:3]
+        df["team_abbr"] = _series(df, "team_abbr", default="", dtype="object").str.upper().str[:3]
+    else:
+        df["team_abbr"] = _series(df, "team_abbr", default="", dtype="object")
+
+    # market, side, line
     if "market_type" in df.columns:
-        df["market_type"] = df["market_type"].apply(_canonical_market)
+        df["market_type"] = _series(df, "market_type", default="", dtype="object").apply(_canonical_market)
+    else:
+        df["market_type"] = _series(df, "market_type", default="", dtype="object")
+
     if "side" in df.columns:
-        df["side"] = df["side"].apply(_canonical_side)
+        df["side"] = _series(df, "side", default="", dtype="object").apply(_canonical_side)
+    else:
+        df["side"] = _series(df, "side", default="", dtype="object")
+
     if "alt_line" in df.columns:
-        df["alt_line"] = df["alt_line"].apply(_to_float)
+        df["alt_line"] = _series(df, "alt_line").apply(_to_float)
+    else:
+        df["alt_line"] = _series(df, "alt_line")  # NaNs
+
+    # q_proj (REQUIRED)
     if "q_proj" in df.columns:
         df["q_proj"] = pd.to_numeric(df["q_proj"], errors="coerce").clip(0.01, 0.99)
-
-    keep = [c for c in ["player_key","team_abbr","market_type","side","alt_line","q_proj"] if c in df.columns]
-    df = df[keep].dropna(how="all")
-
-    # Must have q
-    if "q_proj" not in df.columns:
+    else:
+        # No probabilities = cannot attach anything
         return pd.DataFrame()
 
-    df = df[df["q_proj"].notna()].reset_index(drop=True)
-    return df
+    keep = ["player_key","team_abbr","market_type","side","alt_line","q_proj"]
+    out = df[keep].copy()
+    out = out.dropna(subset=["q_proj"]).reset_index(drop=True)
+    return out
 
 def attach_projections(pool_df: pd.DataFrame, feat_norm: pd.DataFrame):
     """
@@ -113,18 +168,15 @@ def attach_projections(pool_df: pd.DataFrame, feat_norm: pd.DataFrame):
     df = pool_df.copy().reset_index(drop=True)
 
     if "q_model" not in df.columns:
-        # Fall back gracefully if missing
         base = df.get("p_market", pd.Series(0.50, index=df.index))
         df["q_model"] = pd.to_numeric(base, errors="coerce").fillna(0.50).clip(0.01, 0.99)
 
-    # Snapshot BEFORE any merges to preserve alignment
     df["old_q_model"] = df["q_model"].astype(float)
 
     if feat_norm is None or feat_norm.empty:
         df["edge"] = (df["q_model"] - df["p_market"]).fillna(0.0)
         df["ev"]   = (df["q_model"] * df["decimal_odds"] - 1.0).fillna(0.0)
-        applied = 0
-        return df.drop(columns=["old_q_model"], errors="ignore"), applied
+        return df.drop(columns=["old_q_model"], errors="ignore"), 0
 
     if "player_key" not in df.columns:
         df["player_key"] = ""
@@ -135,13 +187,7 @@ def attach_projections(pool_df: pd.DataFrame, feat_norm: pd.DataFrame):
         nonlocal df
         if not set(keys).issubset(feat_norm.columns) or not set(keys).issubset(df.columns):
             return
-        rhs = (
-            feat_norm[keys + ["q_proj"]]
-            .dropna(subset=["q_proj"])
-            .drop_duplicates()
-        )
-        # Merge will duplicate rows when multiple matches exist; that's okay because
-        # 'old_q_model' duplicates with them, keeping row-wise comparison consistent.
+        rhs = feat_norm[keys + ["q_proj"]].dropna(subset=["q_proj"]).drop_duplicates()
         df = df.merge(rhs, on=keys, how="left")
         df["q_proj_tmp"] = df["q_proj_tmp"].combine_first(df["q_proj"])
         df.drop(columns=["q_proj"], inplace=True)
@@ -151,16 +197,13 @@ def attach_projections(pool_df: pd.DataFrame, feat_norm: pd.DataFrame):
     _join(["team_abbr","market_type","side","alt_line"])
     _join(["team_abbr","market_type","side"])
 
-    # Apply and clip
     df["q_proj_tmp"] = df["q_proj_tmp"].clip(0.01, 0.99)
     df["q_model"] = df["q_proj_tmp"].where(df["q_proj_tmp"].notna(), df["q_model"])
 
-    # Count rows where q changed (handle float tolerance and NaNs)
     old = df["old_q_model"].astype(float).to_numpy()
     new = df["q_model"].astype(float).to_numpy()
     applied = int(np.sum(~np.isclose(new, old, rtol=1e-05, atol=1e-08, equal_nan=True)))
 
-    # Cleanup + recompute economics
     df.drop(columns=["q_proj_tmp","old_q_model"], inplace=True, errors="ignore")
     df["edge"] = (df["q_model"] - df["p_market"]).fillna(0.0)
     df["ev"]   = (df["q_model"] * df["decimal_odds"] - 1.0).fillna(0.0)
