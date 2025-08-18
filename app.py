@@ -1,29 +1,32 @@
-# app.py -- MLB Parlay Picker (manual fetch, Apple‑like UI)
-# Fixes:
-#  - No boolean use of DataFrames in `or` (uses get_session_df)
-#  - Props 422: remove dateFormat from /odds props; chunk markets
-#  - Robust empty-state handling
+# app.py -- MLB Parlay Picker (Auto‑Snapshot + Persistence + Alternates + Picks)
+# -----------------------------------------------------------------------------
+# Features:
+# - Manual fetch (you control credits)
+# - Auto-save a snapshot after each successful fetch (toggleable, ON by default)
+# - Odds API player props via /events/{id}/odds (DraftKings)
+# - Alternate pitcher Ks & BB included
+# - Heuristic model + calibration; crash-safe column guards
+# - Persistence: Save/Load snapshot (download/upload), Restore last server snapshot
+# - Top-20 cards with "Took ✓" and My Picks tab with CSV export
+# - Clean, white, minimal UI
 
-import os
-import io
-import math
-import json
-from datetime import datetime, timedelta, timezone
+import os, re, json, math, glob, zipfile
+from io import BytesIO
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
 
-APP_TITLE = "MLB Parlay Picker -- MVP"
-BOOKMAKER = "draftkings"
-TZ = "US/Eastern"
+# ---------------------------- Config ---------------------------------
+APP_TTL_MIN = 30
+BOOK = "draftkings"
+REGION = "us"
+SPORT = "baseball_mlb"
 
-ODDS_API_KEY = st.secrets.get("ODDS_API_KEY", os.getenv("ODDS_API_KEY", ""))
-
-GAME_MARKETS = ["h2h", "spreads"]  # ML + Run Line
-# Only the 4 pitcher markets (incl. alternates where available)
-PROPS_MARKETS = [
+# Include alternates for pitcher Ks & BB
+PROP_MARKETS = [
     "pitcher_strikeouts",
     "pitcher_strikeouts_alternate",
     "pitcher_walks",
@@ -32,666 +35,1442 @@ PROPS_MARKETS = [
     "pitcher_record_a_win",
 ]
 
+SNAP_DIR = "snapshots"
+
+# --------------------------- Utilities --------------------------------
+def _s(x): return "" if x is None else str(x)
+def _cap3(s): return _s(s).upper()[:3]
+def american_to_decimal(a):
+    try:
+        a = int(a)
+        return (1 + a/100) if a > 0 else (1 + 100/(-a))
+    except: return None
+def american_to_prob(a):
+    try:
+        a = int(a)
+        if a >= 0: return 100.0/(a+100.0)
+        return (-a)/((-a)+100.0)
+    except: return None
+def pct(x, d=1):
+    try: return f"{float(x):.{d}%}"
+    except: return "--"
+def first_init_last(full_name:str) -> str:
+    s = _s(full_name).strip()
+    if not s: return ""
+    parts = s.split()
+    if len(parts) == 1: return parts[0].title()
+    return f"{parts[0][0].upper()}. {' '.join(p.title() for p in parts[1:])}"
+
 TEAM_ABBR = {
-    "Arizona Diamondbacks":"ARI","Atlanta Braves":"ATL","Baltimore Orioles":"BAL","Boston Red Sox":"BOS",
-    "Chicago Cubs":"CHC","Chicago White Sox":"CWS","Cincinnati Reds":"CIN","Cleveland Guardians":"CLE",
-    "Colorado Rockies":"COL","Detroit Tigers":"DET","Houston Astros":"HOU","Kansas City Royals":"KC",
-    "Los Angeles Angels":"LAA","Los Angeles Dodgers":"LAD","Miami Marlins":"MIA","Milwaukee Brewers":"MIL",
-    "Minnesota Twins":"MIN","New York Mets":"NYM","New York Yankees":"NYY","Oakland Athletics":"OAK",
-    "Philadelphia Phillies":"PHI","Pittsburgh Pirates":"PIT","San Diego Padres":"SDP","San Francisco Giants":"SFG",
-    "Seattle Mariners":"SEA","St. Louis Cardinals":"STL","Tampa Bay Rays":"TBR","Texas Rangers":"TEX",
-    "Toronto Blue Jays":"TOR","Washington Nationals":"WSH"
+    "Baltimore Orioles":"BAL","Boston Red Sox":"BOS","New York Yankees":"NYY","Tampa Bay Rays":"TBR","Toronto Blue Jays":"TOR",
+    "Chicago White Sox":"CWS","Cleveland Guardians":"CLE","Detroit Tigers":"DET","Kansas City Royals":"KC","Minnesota Twins":"MIN",
+    "Houston Astros":"HOU","Los Angeles Angels":"LAA","Oakland Athletics":"OAK","Seattle Mariners":"SEA","Texas Rangers":"TEX",
+    "Atlanta Braves":"ATL","Miami Marlins":"MIA","New York Mets":"NYM","Philadelphia Phillies":"PHI","Washington Nationals":"WSH",
+    "Chicago Cubs":"CHC","Cincinnati Reds":"CIN","Milwaukee Brewers":"MIL","Pittsburgh Pirates":"PIT","St. Louis Cardinals":"STL",
+    "Arizona Diamondbacks":"ARI","Colorado Rockies":"COL","Los Angeles Dodgers":"LAD","San Diego Padres":"SDP","San Francisco Giants":"SFG",
+}
+ABBR_SET = set(TEAM_ABBR.values())
+
+PARK = {  # coarse defaults
+    "ARI":{"k":0.99,"bb":1.00},"ATL":{"k":0.99,"bb":0.98},"BAL":{"k":1.01,"bb":1.00},
+    "BOS":{"k":0.98,"bb":1.01},"CHC":{"k":1.00,"bb":1.00},"CWS":{"k":1.00,"bb":0.99},
+    "CIN":{"k":0.99,"bb":1.00},"CLE":{"k":1.01,"bb":1.01},"COL":{"k":0.95,"bb":1.02},
+    "DET":{"k":1.02,"bb":1.01},"HOU":{"k":0.99,"bb":0.99},"KC":{"k":1.00,"bb":1.00},
+    "LAA":{"k":1.00,"bb":0.99},"LAD":{"k":1.00,"bb":0.99},"MIA":{"k":1.02,"bb":1.01},
+    "MIL":{"k":0.99,"bb":1.00},"MIN":{"k":1.01,"bb":1.00},"NYM":{"k":1.00,"bb":1.01},
+    "NYY":{"k":0.99,"bb":0.99},"OAK":{"k":1.01,"bb":1.02},"PHI":{"k":0.99,"bb":0.99},
+    "PIT":{"k":1.01,"bb":1.01},"SDP":{"k":1.02,"bb":1.00},"SFG":{"k":1.02,"bb":1.01},
+    "SEA":{"k":1.01,"bb":1.00},"STL":{"k":1.00,"bb":1.00},"TBR":{"k":1.00,"bb":1.00},
+    "TEX":{"k":0.99,"bb":0.99},"TOR":{"k":1.00,"bb":0.99},"WSH":{"k":1.00,"bb":1.01},
 }
 
-# -----------------------------
-# Utilities
-# -----------------------------
+BALLPARK_COORDS = {
+    "ARI": (33.4455, -112.0667),"ATL":(33.8907,-84.4677),"BAL":(39.2839,-76.6217),
+    "BOS": (42.3467, -71.0972),"CHC":(41.9484,-87.6553),"CWS":(41.8300,-87.6339),
+    "CIN": (39.0979, -84.5074),"CLE":(41.4962,-81.6852),"COL":(39.7569,-104.9669),
+    "DET": (42.3390, -83.0485),"HOU":(29.7572,-95.3558),"KC": (39.0516,-94.4803),
+    "LAA": (33.8003,-117.8827),"LAD":(34.0739,-118.2400),"MIA":(25.7781,-80.2197),
+    "MIL": (43.0280, -87.9712),"MIN":(44.9817,-93.2776),"NYM":(40.7571,-73.8458),
+    "NYY": (40.8296, -73.9262),"OAK":(37.7516,-122.2005),"PHI":(39.9057,-75.1665),
+    "PIT": (40.4469, -80.0057),"SDP":(32.7073,-117.1566),"SFG":(37.7786,-122.3893),
+    "SEA": (47.5914, -122.3325),"STL":(38.6226,-90.1928),"TBR":(27.7683,-82.6533),
+    "TEX": (32.7473, -97.0842),"TOR":(43.6414,-79.3894),"WSH":(38.8730,-77.0074),
+}
 
-def get_session_df(key: str) -> pd.DataFrame:
-    val = st.session_state.get(key, None)
-    return val if isinstance(val, pd.DataFrame) else pd.DataFrame()
+def api_key():
+    try: return st.secrets["ODDS_API_KEY"]
+    except Exception: return ""
 
-def american_to_decimal(a) -> float | None:
+def _get(url, params, timeout=15):
+    r = requests.get(url, params=params, timeout=timeout)
+    status = r.status_code
     try:
-        a = float(a)
-    except Exception:
-        return None
-    if a == 0:
-        return None
-    return 1 + (100/abs(a) if a < 0 else a/100)
+        r.raise_for_status()
+        return status, r.json(), None
+    except Exception as e:
+        return status, None, str(e)
 
-def implied_prob_from_american(a) -> float | None:
+@st.cache_data(show_spinner=False, ttl=900)
+def get_weather_factor(team_abbr: str) -> float:
+    ab = _cap3(team_abbr)
+    latlon = BALLPARK_COORDS.get(ab)
+    if not latlon: return 1.0
     try:
-        a = float(a)
+        r = requests.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params=dict(latitude=latlon[0], longitude=latlon[1], hourly="wind_speed_10m,wind_direction_10m", forecast_days=1),
+            timeout=10
+        )
+        r.raise_for_status()
+        js = r.json()
+        wind = float(js["hourly"]["wind_speed_10m"][0])
+        wdir = float(js["hourly"]["wind_direction_10m"][0])
+        factor = 1.0 + max(0.0, wind/20.0) * (1.0 if 200 <= wdir <= 340 else -0.5)
+        return max(0.85, min(1.15, factor))
     except Exception:
-        return None
-    if a == 0:
-        return None
-    return (abs(a)/(abs(a)+100)) if a < 0 else (100/(a+100))
+        return 1.0
 
-def pct(x, nd=1):
-    if x is None or pd.isna(x):
-        return "--"
-    return f"{100*float(x):.{nd}f}%"
-
-def safe_str(x) -> str:
+@st.cache_data(show_spinner=False, ttl=6*3600)
+def get_opponent_rates() -> pd.DataFrame:
     try:
-        return str(x)
+        from pybaseball import team_batting
+        yr = datetime.now().year
+        tb = team_batting(yr)
+        tb["PA"] = tb["AB"] + tb["BB"] + tb["HBP"].fillna(0) + tb["SF"].fillna(0)
+        tb["opp_k_pct"] = tb["SO"] / tb["PA"]
+        tb["opp_bb_pct"] = tb["BB"] / tb["PA"]
+        rows = []
+        for _, r in tb.iterrows():
+            name = _s(r.get("Team"))
+            abbr = TEAM_ABBR.get(name)
+            if not abbr:
+                for k,v in TEAM_ABBR.items():
+                    if name in k or k in name: abbr = v; break
+            if abbr:
+                rows.append(dict(team_abbr=abbr, opp_k_pct=float(r["opp_k_pct"]), opp_bb_pct=float(r["opp_bb_pct"])))
+        df = pd.DataFrame(rows)
+        if df.empty: raise RuntimeError("fallback")
+        return df
     except Exception:
-        return ""
+        return pd.DataFrame([dict(team_abbr=ab, opp_k_pct=0.22, opp_bb_pct=0.08) for ab in ABBR_SET])
 
-def first_initial_last(full_name: str) -> str:
-    s = (full_name or "").replace(".", "").strip()
-    if not s:
-        return ""
-    parts = s.split()
-    if len(parts) == 1:
-        return parts[0]
-    return f"{parts[0][0]}. {parts[-1]}"
+# --------------------------- Persistence ------------------------------
+def save_snapshot_to_zip(events_df, board_df, props_df, rates_df) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        if isinstance(events_df, pd.DataFrame) and not events_df.empty:
+            z.writestr("events.csv", events_df.to_csv(index=False))
+        if isinstance(board_df, pd.DataFrame) and not board_df.empty:
+            z.writestr("board.csv", board_df.to_csv(index=False))
+        if isinstance(props_df, pd.DataFrame) and not props_df.empty:
+            z.writestr("props.csv", props_df.to_csv(index=False))
+        if isinstance(rates_df, pd.DataFrame) and not rates_df.empty:
+            z.writestr("rates.csv", rates_df.to_csv(index=False))
+    buf.seek(0)
+    return buf.getvalue()
 
-def fmt_team(abbr: str | None) -> str:
-    return safe_str(abbr).upper()[:3] if abbr else ""
+def load_snapshot_from_zip(file) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    try:
+        with zipfile.ZipFile(file) as z:
+            def _rd(name):
+                try:
+                    with z.open(name) as f:
+                        return pd.read_csv(f)
+                except: return pd.DataFrame()
+            return _rd("events.csv"), _rd("board.csv"), _rd("props.csv"), _rd("rates.csv")
+    except:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-def short_market_label(market_key: str) -> str:
-    M = {
-        "h2h":"ML",
-        "spreads":"Run Line",
-        "pitcher_strikeouts":"Ks",
-        "pitcher_strikeouts_alternate":"Ks",
-        "pitcher_walks":"BB",
-        "pitcher_walks_alternate":"BB",
-        "pitcher_hits_allowed":"Hits Allowed",
-        "pitcher_hits_allowed_alternate":"Hits Allowed",
-        "pitcher_earned_runs":"ER",
-        "pitcher_outs":"Outs",
-        "pitcher_record_a_win":"Win",
-    }
-    return M.get(market_key, market_key)
+def write_server_snapshot(bytes_data: bytes) -> str:
+    os.makedirs(SNAP_DIR, exist_ok=True)
+    fname = f"snapshot_{datetime.now().strftime('%Y%m%d_%H%M%S')}.zip"
+    path = os.path.join(SNAP_DIR, fname)
+    with open(path, "wb") as f:
+        f.write(bytes_data)
+    return path
 
-def clean_side(side_text: str) -> str:
-    s = (side_text or "").strip().lower()
-    if "over" in s: return "Over"
-    if "under" in s: return "Under"
-    if "yes" in s: return "Yes"
-    if "no" in s: return "No"
-    return side_text
+def last_server_snapshot_path() -> str|None:
+    files = sorted(glob.glob(os.path.join(SNAP_DIR, "snapshot_*.zip")))
+    return files[-1] if files else None
 
-def build_bet_title(r: pd.Series) -> str:
-    market = r.get("market_key","")
-    cat = r.get("category","")
-    side = r.get("side","")
-    team = fmt_team(r.get("team_abbr",""))
-    opp = fmt_team(r.get("opp_abbr",""))
-    is_home = r.get("is_home", None)
-    matchup = f"{opp}@{team}" if is_home is True else (f"{team}@{opp}" if is_home is False else f"{opp}@{team}")
-    label = short_market_label(market)
-    line = r.get("line", None)
-    player = r.get("player_name","")
-    name = first_initial_last(player)
+# Helper to auto-save snapshot and update session state
+def autosave_snapshot(ss) -> str|None:
+    try:
+        bytes_zip = save_snapshot_to_zip(ss.get("events_df"), ss.get("board_df"), ss.get("props_df"), ss.get("rates_df"))
+        if bytes_zip and len(bytes_zip) > 0:
+            ss["last_snapshot_bytes"] = bytes_zip
+            path = write_server_snapshot(bytes_zip)
+            ss["last_snapshot_path"] = path
+            ss["last_snapshot_ts"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            return path
+    except Exception as e:
+        ss["last_snapshot_error"] = str(e)
+    return None
 
-    if cat in ("Moneyline","Run Line"):
-        if cat == "Run Line":
-            rl = r.get("line_run", "")
-            return f"{team} -{abs(rl):g}" if rl and rl < 0 else f"{team} +{abs(rl):g}" if rl else f"{team} {label} ({matchup})"
-        return f"{team} {label} ({matchup})"
+# --------------------------- Fetchers --------------------------------
+def _stable_events_arg(event_ids):
+    if not event_ids: return tuple()
+    return tuple(sorted(set(_s(e) for e in event_ids)))
 
-    if side in ("Over","Under") and line is not None and not pd.isna(line):
-        side_short = "O" if side == "Over" else "U"
-        return f"{name} ({team}) {side_short}{line:g} {label}"
-    if side in ("Yes","No"):
-        return f"{name} ({team}) Win {'YES' if side=='Yes' else 'NO'}"
-    return f"{name} ({team}) {label}"
+def _stable_markets_arg(markets):
+    if not markets: return tuple()
+    return tuple(sorted(set(_s(m) for m in markets)))
 
-def chips_row(r: pd.Series) -> str:
-    odds = r.get("american_odds")
-    q = r.get("q_model")
-    p = r.get("p_market")
-    edge = (q - p) if (pd.notna(q) and pd.notna(p)) else None
-    oppK = r.get("opp_k_rate")
-    oppBB = r.get("opp_bb_rate")
-    pills = []
-    pills.append(f"<span class='chip'>Odds {int(odds) if pd.notna(odds) else '--'}</span>")
-    pills.append(f"<span class='chip'>q {pct(q)}</span>")
-    pills.append(f"<span class='chip'>Market {pct(p)}</span>")
-    if edge is not None:
-        pills.append(f"<span class='chip'>Edge {edge*100:+.1f}%</span>")
-    if pd.notna(oppK): pills.append(f"<span class='chip'>OppK {oppK*100:.1f}%</span>")
-    if pd.notna(oppBB): pills.append(f"<span class='chip'>OppBB {oppBB*100:.1f}%</span>")
-    return " ".join(pills)
+@st.cache_data(show_spinner=False, ttl=APP_TTL_MIN*60)
+def fetch_events() -> pd.DataFrame:
+    key = api_key()
+    if not key: return pd.DataFrame()
+    u = f"https://api.the-odds-api.com/v4/sports/{SPORT}/events"
+    status, js, err = _get(u, dict(apiKey=key, dateFormat="iso"))
+    if err or not isinstance(js, list): return pd.DataFrame()
+    rows = []
+    for ev in js:
+        home = TEAM_ABBR.get(ev.get("home_team"), _cap3(ev.get("home_team")))
+        away = TEAM_ABBR.get(ev.get("away_team"), _cap3(ev.get("away_team")))
+        rows.append(dict(
+            event_id=ev.get("id"),
+            start=ev.get("commence_time"),
+            home_abbr=home, away_abbr=away,
+            matchup=f"{away}@{home}"
+        ))
+    return pd.DataFrame(rows).drop_duplicates("event_id")
 
-def render_card(r: pd.Series):
-    title = build_bet_title(r)
-    chips = chips_row(r)
-    st.markdown(f"""
-    <div class="card">
-      <div class="card-title">{st.escape_markdown(title)}</div>
-      <div class="card-sub">{chips}</div>
-    </div>
-    """, unsafe_allow_html=True)
+@st.cache_data(show_spinner=False, ttl=APP_TTL_MIN*60)
+def fetch_board() -> pd.DataFrame:
+    key = api_key()
+    if not key: return pd.DataFrame()
+    u = f"https://api.the-odds-api.com/v4/sports/{SPORT}/odds"
+    status, js, err = _get(u, dict(apiKey=key, regions=REGION, bookmakers=BOOK,
+                                   oddsFormat="american", dateFormat="iso", markets="h2h,spreads"))
+    if err or not isinstance(js, list): return pd.DataFrame()
+    rows = []
+    for g in js:
+        eid = g.get("id")
+        home = TEAM_ABBR.get(g.get("home_team"), _cap3(g.get("home_team")))
+        away = TEAM_ABBR.get(g.get("away_team"), _cap3(g.get("away_team")))
+        matchup = f"{away}@{home}"
+        for bk in g.get("bookmakers", []):
+            if bk.get("key") != BOOK: continue
+            for m in bk.get("markets", []):
+                mkey = m.get("key")
+                if mkey not in ("h2h","spreads"): continue
+                for o in m.get("outcomes", []):
+                    price = o.get("price")
+                    line = o.get("point")
+                    name = o.get("name")
+                    category = "Moneyline" if mkey=="h2h" else "Run Line"
+                    team = TEAM_ABBR.get(name, _cap3(name))
+                    rows.append(dict(
+                        event_id=eid, market_type=category, team_abbr=team, player_name=None,
+                        side=None, line=line, american_odds=price, decimal_odds=american_to_decimal(price),
+                        p_market=american_to_prob(price), game_id=eid, home_abbr=home, away_abbr=away,
+                        description=f"{team} {'ML' if category=='Moneyline' else (f'{line:+.1f}' if line is not None else '')} ({matchup})",
+                        category=category, matchup=matchup
+                    ))
+    df = pd.DataFrame(rows)
+    if df.empty: return df
+    return df.drop_duplicates(subset=["event_id","market_type","team_abbr","line","american_odds"])
 
-# -----------------------------
-# Data fetchers (manual)
-# -----------------------------
+@st.cache_data(show_spinner=False, ttl=APP_TTL_MIN*60)
+def fetch_props_by_events_cached(event_key: tuple, markets_key: tuple) -> pd.DataFrame:
+    """Cached layer keyed only by stable args. Calls the actual network function."""
+    return _fetch_props_by_events_network(list(event_key), list(markets_key))
 
-def oddsapi_events(date_str: str) -> pd.DataFrame:
-    url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/events"
-    params = {"apiKey": ODDS_API_KEY, "dateFormat":"iso"}
-    r = requests.get(url, params=params, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    rows=[]
-    for e in data:
-        rows.append({
-            "event_id": e.get("id"),
-            "commence_time": e.get("commence_time"),
-            "home_team": e.get("home_team"),
-            "away_team": e.get("away_team"),
-            "home_abbr": TEAM_ABBR.get(e.get("home_team",""), None),
-            "away_abbr": TEAM_ABBR.get(e.get("away_team",""), None),
-        })
+def _fetch_props_by_events_network(event_ids:list[str], markets:list[str]) -> pd.DataFrame:
+    key = api_key()
+    if not key or not event_ids: return pd.DataFrame()
+    rows = []
+    for eid in event_ids:
+        u = f"https://api.the-odds-api.com/v4/sports/{SPORT}/events/{eid}/odds"
+        params = dict(apiKey=key, regions=REGION, bookmakers=BOOK, oddsFormat="american", dateFormat="iso", markets=",".join(markets))
+        status, js, err = _get(u, params)
+        if err or not isinstance(js, dict): 
+            continue
+        home = TEAM_ABBR.get(js.get("home_team"), _cap3(js.get("home_team")))
+        away = TEAM_ABBR.get(js.get("away_team"), _cap3(js.get("away_team")))
+        matchup = f"{away}@{home}"
+        for bk in js.get("bookmakers", []):
+            if bk.get("key") != BOOK: continue
+            for m in bk.get("markets", []):
+                mkey = m.get("key")
+                if mkey not in markets: continue
+                for o in m.get("outcomes", []):
+                    price = o.get("price")
+                    line  = o.get("point")
+                    side  = (_s(o.get("name")).lower() if o.get("name") else None)
+                    # Try best-effort player name extraction:
+                    player = o.get("description") or o.get("participant") or o.get("player")
+                    if isinstance(player, str) and (" Over" in player or " Under" in player):
+                        player = re.split(r"\sOver|\sUnder", player)[0]
+                    player = _s(player).strip()
+                    team = TEAM_ABBR.get(o.get("team") or o.get("participant"), "")
+                    rows.append(dict(
+                        event_id=eid, market_type=mkey, team_abbr=team, player_name=player,
+                        side=side, line=line, american_odds=price, decimal_odds=american_to_decimal(price),
+                        p_market=american_to_prob(price), game_id=eid, home_abbr=home, away_abbr=away,
+                        description="", category=_pretty_category(mkey), matchup=matchup
+                    ))
     return pd.DataFrame(rows)
 
-def oddsapi_odds_board(markets: list[str]) -> list[dict]:
-    """Board (ML/RL). Keep dateFormat off or on? It's fine here but not required."""
-    url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
-    params = {
-        "apiKey": ODDS_API_KEY,
-        "regions": "us",
-        "oddsFormat": "american",
-        "markets": ",".join(markets),
-        "bookmakers": BOOKMAKER,
-    }
-    r = requests.get(url, params=params, timeout=45)
-    r.raise_for_status()
-    return r.json()
+def _pretty_category(mkey:str) -> str:
+    mkey = _s(mkey)
+    if "strikeout" in mkey: return "Pitcher Ks"
+    if "walks" in mkey and "pitcher" in mkey: return "Pitcher BB"
+    if "outs" in mkey and "pitcher" in mkey: return "Pitcher Outs"
+    if "record_a_win" in mkey: return "Pitcher Win"
+    return mkey
 
-def oddsapi_odds_props_chunked(all_markets: list[str], chunk_size=3) -> list[dict]:
-    """Fetch props in small chunks to avoid 422; omit dateFormat entirely."""
-    url = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
-    out = []
-    for i in range(0, len(all_markets), chunk_size):
-        mk = all_markets[i:i+chunk_size]
-        params = {
-            "apiKey": ODDS_API_KEY,
-            "regions": "us",
-            "oddsFormat": "american",
-            "markets": ",".join(mk),
-            "bookmakers": BOOKMAKER,
-        }
-        r = requests.get(url, params=params, timeout=45)
-        try:
-            r.raise_for_status()
-        except requests.HTTPError as e:
-            # Surface the server message to the UI
-            try:
-                st.error(f"Props chunk {mk} fetch failed: {r.status_code} {r.text[:250]}")
-            except Exception:
-                st.error(f"Props chunk {mk} fetch failed: {e}")
-            continue
-        js = r.json()
-        # merge per-event nodes
-        out.extend(js)
+# ---------------------- Modeling (heuristic) --------------------------
+def _poisson_cdf(k, lam):
+    if lam is None or lam <= 0: return 0.0
+    if lam > 30:
+        z = (k + 0.5 - lam) / math.sqrt(lam)
+        return 0.5*(1.0 + math.erf(z/math.sqrt(2)))
+    from math import exp
+    p, s = exp(-lam), exp(-lam)
+    for i in range(1, int(k)+1):
+        p *= lam / i
+        s += p
+    return s
+
+def _over_prob(line, lam):
+    try:
+        thr = math.floor(float(line) + 1e-9)
+        return 1.0 - _poisson_cdf(thr - 1, lam)
+    except Exception:
+        return None
+
+def _logit(p):
+    p = max(1e-6, min(1-1e-6, float(p))); return math.log(p/(1-p))
+def _inv(z): return 1.0/(1.0+math.exp(-float(z)))
+
+@st.cache_data(show_spinner=False, ttl=6*3600)
+def pitcher_last5(name: str) -> dict:
+    try:
+        from pybaseball import playerid_lookup, statcast_pitcher
+        nm = _s(name)
+        if not nm: return {}
+        fs = nm.split()
+        first, last = fs[0], fs[-1]
+        ids = playerid_lookup(last=last, first=first)
+        if ids is None or ids.empty: return {}
+        mlbam = int(ids.iloc[0]["key_mlbam"])
+        end = datetime.now().date()
+        start = end - timedelta(days=60)
+        df = statcast_pitcher(start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), mlbam)
+        if df is None or df.empty: return {}
+        df["isK"] = df["description"].str.contains("strikeout", na=False)
+        df["isBB"] = df["description"].str.contains("walk", na=False)
+        g = df.groupby("game_date").agg(pitches=("pitch_number","max"),
+                                        Ks=("isK","sum"), BB=("isBB","sum"),
+                                        outs=("outs_when_up","max"))
+        g = g.reset_index().sort_values("game_date", ascending=False).head(5)
+        if g.empty: return {}
+        ip = (g["outs"].fillna(0)/3.0).mean()
+        pc = g["pitches"].mean()
+        k9 = (g["Ks"].sum() / max(1.0, (g["outs"].fillna(0).sum()/3.0))) * 9.0
+        bb9 = (g["BB"].sum() / max(1.0, (g["outs"].fillna(0).sum()/3.0))) * 9.0
+        last_game = pd.to_datetime(g["game_date"].iloc[0]).date()
+        rest = (datetime.now().date() - last_game).days
+        return {"ip_l5":float(ip), "pc_l5":float(pc), "k9_l5":float(k9), "bb9_l5":float(bb9), "rest":int(rest)}
+    except Exception:
+        return {}
+
+def enhanced_q(df: pd.DataFrame, use_weather=True, use_park=True, use_form=True) -> pd.DataFrame:
+    if df is None or df.empty: return df.copy()
+    K9, BB9, IP0 = 8.5, 3.3, 5.8
+    opp_rates = get_opponent_rates().set_index("team_abbr")
+
+    q_list, why = [], []
+    for _, r in df.iterrows():
+        m = _s(r.get("market_type"))
+        side = _s(r.get("side")).lower()
+        line = r.get("line")
+        team = _cap3(r.get("team_abbr") or r.get("home_abbr"))
+        p_mkt = r.get("p_market") or 0.5
+
+        if "strikeout" in m:
+            lam = IP0 * (K9/9.0); p0 = _over_prob(line, lam); p0 = p0 if side=="over" else (1-p0)
+        elif "walks" in m and "pitcher" in m:
+            lam = IP0 * (BB9/9.0); p0 = _over_prob(line, lam); p0 = p0 if side=="over" else (1-p0)
+        elif "outs" in m and "pitcher" in m:
+            mu, sd = IP0*3.0, 3.0
+            if line is None: p0 = p_mkt
+            else:
+                z0 = (float(line) - 0.5 - mu)/sd
+                p_over = 0.5*(1 - math.erf(z0/math.sqrt(2)))
+                p0 = p_over if side=="over" else (1-p_over)
+        elif "record_a_win" in m:
+            p0 = 0.55 if side in ("yes","over") else 0.45
+        else:
+            p0 = p_mkt
+        z = _logit(p0); bits = []
+
+        ok = float(opp_rates.loc[team,"opp_k_pct"]) if team in opp_rates.index else 0.22
+        ob = float(opp_rates.loc[team,"opp_bb_pct"]) if team in opp_rates.index else 0.08
+        if "strikeout" in m:
+            z += 0.60*((ok-0.22)/0.10); bits.append(f"oppK {ok:.0%}")
+        if "walks" in m and "pitcher" in m:
+            z += 0.60*((ob-0.08)/0.10); bits.append(f"oppBB {ob:.0%}")
+
+        if use_park:
+            pf = PARK.get(team, {"k":1.0,"bb":1.0})
+            if "strikeout" in m:
+                z += 0.30*((pf["k"]-1.0)/0.10); bits.append(f"ParkK×{pf['k']:.2f}")
+            if "walks" in m and "pitcher" in m:
+                z += 0.20*((pf["bb"]-1.0)/0.10); bits.append(f"ParkBB×{pf['bb']:.2f}")
+
+        if use_weather and (("strikeout" in m) or ("outs" in m and "pitcher" in m)):
+            wf = get_weather_factor(team)
+            z += 0.15*((wf-1.0)*2.0); bits.append(f"Wind×{wf:.2f}")
+
+        if use_form and _s(r.get("player_name")):
+            f = pitcher_last5(r["player_name"])
+            if f:
+                if "strikeout" in m and f.get("k9_l5"): z += 0.35*((f["k9_l5"]-K9)/2.0); bits.append(f"K9L5 {f['k9_l5']:.1f}")
+                if "walks" in m and "pitcher" in m and f.get("bb9_l5"): z += -0.35*((f["bb9_l5"]-BB9)/2.0); bits.append(f"BB9L5 {f['bb9_l5']:.1f}")
+                if "outs" in m and "pitcher" in m and f.get("ip_l5"): z += 0.25*((f["ip_l5"]-IP0)); bits.append(f"IPL5 {f['ip_l5']:.1f}")
+
+        q_list.append(1.0/(1.0+math.exp(-z)))
+        why.append(" • ".join(bits))
+    out = df.copy()
+    out["q_enh"] = q_list
+    out["q_notes"] = why
     return out
 
-def normalize_board(data_json: list[dict]) -> pd.DataFrame:
-    rows=[]
-    for ev in data_json:
-        eid = ev.get("id")
-        home = ev.get("home_team"); away = ev.get("away_team")
-        home_abbr = TEAM_ABBR.get(home,""); away_abbr = TEAM_ABBR.get(away,"")
-        for bm in ev.get("bookmakers", []):
-            if bm.get("key") != BOOKMAKER: 
-                continue
-            for mk in bm.get("markets", []):
-                key = mk.get("key","")
-                if key == "h2h":
-                    for oc in mk.get("outcomes", []):
-                        name = oc.get("name","")
-                        price = oc.get("price")
-                        is_home = (name == home)
-                        team_abbr = TEAM_ABBR.get(name, home_abbr if is_home else away_abbr)
-                        opp_abbr = away_abbr if is_home else home_abbr
-                        rows.append({
-                            "event_id": eid,"category":"Moneyline","market_key":"h2h","side":"",
-                            "team_abbr":team_abbr,"opp_abbr":opp_abbr,"is_home":is_home,
-                            "player_name":"","line":None,"line_run":None,"american_odds":price
-                        })
-                elif key == "spreads":
-                    for oc in mk.get("outcomes", []):
-                        name = oc.get("name",""); price = oc.get("price"); point = oc.get("point")
-                        is_home = (name == home)
-                        team_abbr = TEAM_ABBR.get(name, home_abbr if is_home else away_abbr)
-                        opp_abbr = away_abbr if is_home else home_abbr
-                        rows.append({
-                            "event_id": eid,"category":"Run Line","market_key":"spreads","side":"",
-                            "team_abbr":team_abbr,"opp_abbr":opp_abbr,"is_home":is_home,
-                            "player_name":"","line":None,"line_run":point,"american_odds":price
-                        })
-    return pd.DataFrame(rows)
-
-def normalize_props(data_json: list[dict]) -> pd.DataFrame:
-    rows=[]
-    for ev in data_json:
-        eid = ev.get("id")
-        home = ev.get("home_team"); away = ev.get("away_team")
-        for bm in ev.get("bookmakers", []):
-            if bm.get("key") != BOOKMAKER: 
-                continue
-            for mk in bm.get("markets", []):
-                key = mk.get("key","")
-                if key not in PROPS_MARKETS:
-                    continue
-                for oc in mk.get("outcomes", []):
-                    side = clean_side(oc.get("name",""))
-                    point = oc.get("point")
-                    price = oc.get("price")
-                    player = oc.get("participant") or oc.get("description") or ""
-                    rows.append({
-                        "event_id":eid,"category":"Pitcher "+short_market_label(key) if "pitcher_" in key else short_market_label(key),
-                        "market_key":key,"side":side,
-                        "team_abbr":None,"opp_abbr":None,"is_home":None,
-                        "player_name":player,"line":point,"line_run":None,"american_odds":price
-                    })
-    return pd.DataFrame(rows)
-
-def mlb_probables(date: datetime) -> pd.DataFrame:
-    d = date.strftime("%Y-%m-%d")
-    url = f"https://statsapi.mlb.com/api/v1/schedule?sportId=1&date={d}&hydrate=probablePitcher,team"
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    js = r.json()
-    rows=[]
-    for blk in js.get("dates", []):
-        for g in blk.get("games", []):
-            hm = g.get("teams",{}).get("home",{})
-            aw = g.get("teams",{}).get("away",{})
-            hp = (hm.get("probablePitcher") or {}).get("fullName")
-            ap = (aw.get("probablePitcher") or {}).get("fullName")
-            home_name = hm.get("team",{}).get("name","")
-            away_name = aw.get("team",{}).get("name","")
-            rows.append({
-                "event_home": TEAM_ABBR.get(home_name,""),
-                "event_away": TEAM_ABBR.get(away_name,""),
-                "home_pitcher": hp, "away_pitcher": ap
-            })
-    return pd.DataFrame(rows)
-
-def attach_probables_to_props(props_df: pd.DataFrame, prob_df: pd.DataFrame, events_df: pd.DataFrame) -> pd.DataFrame:
-    if props_df.empty or prob_df.empty or events_df.empty:
-        return props_df
-    props_df = props_df.copy()
-
-    pairs = events_df[["event_id","home_abbr","away_abbr"]].drop_duplicates()
-    pair_map = {r.event_id:(r.home_abbr,r.away_abbr) for _, r in pairs.iterrows()}
-
-    for i, r in props_df.iterrows():
-        eid = r.get("event_id"); player = (r.get("player_name") or "").replace(".","").lower().strip()
-        if not eid or not player: 
-            continue
-        home_abbr, away_abbr = pair_map.get(eid, (None,None))
-        if not home_abbr or not away_abbr:
-            continue
-        cand = prob_df[(prob_df["event_home"]==home_abbr) & (prob_df["event_away"]==away_abbr)]
-        if cand.empty:
-            cand = prob_df[(prob_df["event_home"]==away_abbr) & (prob_df["event_away"]==home_abbr)]
-        if not cand.empty:
-            row = cand.iloc[0]
-            hp = (row.get("home_pitcher") or "").replace(".","").lower()
-            ap = (row.get("away_pitcher") or "").replace(".","").lower()
-            if hp and player in hp:
-                props_df.at[i,"team_abbr"] = row.get("event_home"); props_df.at[i,"opp_abbr"] = row.get("event_away"); props_df.at[i,"is_home"]=True
-            elif ap and player in ap:
-                props_df.at[i,"team_abbr"] = row.get("event_away"); props_df.at[i,"opp_abbr"] = row.get("event_home"); props_df.at[i,"is_home"]=False
-    return props_df
-
-def mlb_team_rates_last_days(days=21) -> pd.DataFrame:
-    end = datetime.now(timezone.utc); start = end - timedelta(days=days)
-    start_str, end_str = start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
-    teams_url = "https://statsapi.mlb.com/api/v1/teams?sportId=1&activeStatus=Y"
-    tr = requests.get(teams_url, timeout=30); tr.raise_for_status()
-    teams = tr.json().get("teams", [])
-    rows=[]
-    for t in teams:
-        name = t.get("name",""); abbr = TEAM_ABBR.get(name)
-        if not abbr: continue
-        tid = t.get("id")
-        url = f"https://statsapi.mlb.com/api/v1/teams/{tid}/stats?stats=byDateRange&group=hitting&startDate={start_str}&endDate={end_str}"
-        r = requests.get(url, timeout=30)
-        if r.status_code != 200: continue
-        stats = r.json().get("stats", [])
-        stat = (stats[0].get("splits",[]) or [{}])[0].get("stat",{})
-        so = float(stat.get("strikeOuts",0)); bb = float(stat.get("baseOnBalls",0))
-        pa = float(stat.get("plateAppearances",0))
-        if pa == 0:
-            ab = float(stat.get("atBats",0)); hbp = float(stat.get("hitByPitch",0))
-            sb = float(stat.get("sacBunts",0)); sf = float(stat.get("sacFlies",0))
-            pa = ab + bb + hbp + sb + sf
-        k_rate = so/pa if pa else np.nan; bb_rate = bb/pa if pa else np.nan
-        rows.append({"team_abbr": abbr, "opp_k_rate": k_rate, "opp_bb_rate": bb_rate})
-    return pd.DataFrame(rows)
-
-def vig_free_pair(a1, a2):
-    if a1 is None or a2 is None: return (implied_prob_from_american(a1), implied_prob_from_american(a2))
-    p1 = implied_prob_from_american(a1); p2 = implied_prob_from_american(a2)
-    if p1 is None or p2 is None: return (p1, p2)
-    s = p1 + p2
-    if s == 0: return (p1, p2)
-    return (p1/s, p2/s)
-
-def compute_probs(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df["p_market"] = np.nan
-    # Moneyline vig removal
-    ml = df[df["category"]=="Moneyline"]
-    for eid, g in ml.groupby("event_id"):
-        idx = list(g.index)
-        if len(idx) >= 2:
-            p1 = df.at[idx[0],"american_odds"]; p2 = df.at[idx[1],"american_odds"]
-            vf1, vf2 = vig_free_pair(p1, p2)
-            df.at[idx[0], "p_market"] = vf1; df.at[idx[1], "p_market"] = vf2
-    # Others: single leg implied
-    mask = df["p_market"].isna()
-    df.loc[mask, "p_market"] = df.loc[mask, "american_odds"].apply(implied_prob_from_american)
-    return df
-
-def join_opponent_rates(df: pd.DataFrame, rates: pd.DataFrame) -> pd.DataFrame:
-    if rates is None or rates.empty: return df
-    return df.merge(rates, left_on="opp_abbr", right_on="team_abbr", how="left").drop(columns=["team_abbr_y"], errors="ignore").rename(columns={"team_abbr_x":"team_abbr"})
-
-def attach_features(df: pd.DataFrame, feat: pd.DataFrame | None) -> pd.DataFrame:
-    df = df.copy()
-    df["q_model"] = df["p_market"]  # fallback
-    if feat is None or feat.empty:
+def calibrate_vs_market(df: pd.DataFrame, lam: float=0.25) -> pd.DataFrame:
+    if df is None: return pd.DataFrame()
+    if df.empty:
+        df = df.copy()
+        if "p_market" not in df.columns: df["p_market"] = []
+        if "q_enh" not in df.columns: df["q_enh"] = []
+        df["q_final"] = df.get("q_enh", df.get("p_market", 0.5))
         return df
-    f = feat.copy(); f.columns = [c.lower() for c in f.columns]
-    if "q_proj" not in f.columns: return df
-    if "player_name" in f.columns:
-        f["player_key"] = f["player_name"].fillna("").str.replace(".","", regex=False).str.strip().str.lower()
-        df["player_key"] = df["player_name"].fillna("").str.replace(".","", regex=False).str.strip().str.lower()
-        df = df.merge(f[["player_key","q_proj"]], on="player_key", how="left")
-        df["q_model"] = df["q_proj"].where(df["q_proj"].notna(), df["q_model"])
-        df.drop(columns=["player_key","q_proj"], inplace=True, errors="ignore")
+    p = df["q_enh"].fillna(df["p_market"].fillna(0.5)).clip(1e-6, 1-1e-6).astype(float)
+    m = df["p_market"].fillna(0.5).clip(1e-6, 1-1e-6).astype(float)
+    z = (1-lam)*p.map(lambda x: math.log(x/(1-x))) + lam*m.map(lambda x: math.log(x/(1-x)))
+    df = df.copy()
+    df["q_final"] = z.map(lambda x: 1.0/(1.0+math.exp(-x)))
     return df
 
-def build_pool(board_df: pd.DataFrame, props_df: pd.DataFrame, events_df: pd.DataFrame,
-               prob_df: pd.DataFrame, rates_df: pd.DataFrame, feat_df: pd.DataFrame | None) -> pd.DataFrame:
-    pieces = []
-    if isinstance(board_df, pd.DataFrame) and not board_df.empty: pieces.append(board_df)
-    if isinstance(props_df, pd.DataFrame) and not props_df.empty:
-        # attach teams to props via probables + events
-        props_df = attach_probables_to_props(props_df, prob_df, events_df)
-        pieces.append(props_df)
-    if not pieces:
-        return pd.DataFrame()
-    df = pd.concat(pieces, ignore_index=True, sort=False)
-
-    df = compute_probs(df)
-    df = join_opponent_rates(df, rates_df)
-    df = attach_features(df, feat_df)
-
-    # Ensure columns exist
-    for c in ["team_abbr","opp_abbr","player_name","market_key","category","side","line","line_run","american_odds","p_market","q_model"]:
-        if c not in df.columns: df[c] = np.nan
-
-    # Title/edge
-    df["description"] = df.apply(build_bet_title, axis=1)
-    df["edge"] = df["q_model"] - df["p_market"]
-    df["q_pct"] = (df["q_model"]*100).round(1)
-    df["p_pct"] = (df["p_market"]*100).round(1)
-
-    # Dedupe
-    keys = ["event_id","team_abbr","player_name","market_key","side","line","line_run","american_odds"]
-    df = df.drop_duplicates(subset=keys).reset_index(drop=True)
-
+def ensure_prob_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None: return pd.DataFrame()
+    df = df.copy()
+    if "p_market" not in df.columns:
+        df["p_market"] = df["american_odds"].map(american_to_prob)
+    else:
+        df["p_market"] = df["p_market"].fillna(df["american_odds"].map(american_to_prob))
+    if "q_enh" not in df.columns:
+        df["q_enh"] = df["p_market"].fillna(0.5)
+    if "q_final" not in df.columns:
+        df["q_final"] = df["q_enh"].fillna(df["p_market"]).fillna(0.5)
     return df
 
-# -----------------------------
-# UI
-# -----------------------------
+# ----------------------- Pool & Formatting ---------------------------
+def _clean_market_text(mkey:str) -> str:
+    mkey = _s(mkey)
+    if "strikeout" in mkey: return "Ks"
+    if "walk" in mkey and "pitcher" in mkey: return "BB"
+    if "outs" in mkey and "pitcher" in mkey: return "Outs"
+    if "record_a_win" in mkey: return "Win"
+    return mkey
 
-APP_CSS = """
-<style>
-  :root { --ink:#111827; --muted:#6b7280; --chip:#f3f4f6; }
-  .metric-wrap{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:8px 0 18px;}
-  .metric{background:#fff;border:1px solid #eee;border-radius:14px;padding:12px 10px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.04);}
-  .metric .big{font-weight:700;font-size:20px;color:var(--ink);}
-  .metric .sub{font-size:12px;color:var(--muted);}
-  .card{background:#fff;border:1px solid #eee;border-radius:14px;padding:12px 14px;margin:10px 0;box-shadow:0 1px 3px rgba(0,0,0,.05);}
-  .card-title{font-weight:600;color:var(--ink);margin-bottom:6px;}
-  .card-sub{color:var(--muted);font-size:12px;}
-  .chip{display:inline-block;background:var(--chip);padding:3px 8px;border-radius:999px;margin-right:6px;border:1px solid #e5e7eb}
-  .pill{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid #e5e7eb;background:#fff;font-size:12px;margin-right:6px;}
-</style>
-"""
+def _pretty_category(mkey:str) -> str:
+    mkey = _s(mkey)
+    if "strikeout" in mkey: return "Pitcher Ks"
+    if "walks" in mkey and "pitcher" in mkey: return "Pitcher BB"
+    if "outs" in mkey and "pitcher" in mkey: return "Pitcher Outs"
+    if "record_a_win" in mkey: return "Pitcher Win"
+    return mkey
 
-st.set_page_config(page_title=APP_TITLE, page_icon="⚾", layout="centered")
-st.markdown(APP_CSS, unsafe_allow_html=True)
-st.title(APP_TITLE)
-st.caption("Manual fetch (save credits) • Apple‑like cards • Vig‑free market % + optional projections (q)")
+def describe_row(row: pd.Series) -> str:
+    mtext = _clean_market_text(row.get("market_type",""))
+    side = _s(row.get("side")).title() if row.get("side") else ""
+    line = row.get("line")
+    matchup = row.get("matchup") or f"{_cap3(row.get('away_abbr'))}@{_cap3(row.get('home_abbr'))}"
+    team = _cap3(row.get("team_abbr"))
+    if row.get("player_name"):
+        nm = first_init_last(row["player_name"])
+        if line not in (None, float("nan")):
+            bet = f"{nm} ({team or '--'}) {side} {line:g} {mtext}"
+        else:
+            bet = f"{nm} ({team or '--'}) {side} {mtext}"
+    else:
+        if row.get("market_type") == "Moneyline":
+            bet = f"{team} ML ({matchup})"
+        else:
+            bet = f"{team} {row.get('line',0):+0.1f} ({matchup})" if row.get("line") is not None else f"{team} RL ({matchup})"
+    return bet
 
-# State init
-for k in ["events_df","board_df","props_df","prob_df","rates_df","features_df"]:
-    st.session_state.setdefault(k, None)
+def build_pool(board_df: pd.DataFrame, props_df: pd.DataFrame) -> pd.DataFrame:
+    b = board_df.copy() if isinstance(board_df, pd.DataFrame) else pd.DataFrame()
+    p = props_df.copy() if isinstance(props_df, pd.DataFrame) else pd.DataFrame()
+    cols = ["event_id","market_type","team_abbr","player_name","side","line","american_odds","decimal_odds","p_market","home_abbr","away_abbr","category","matchup"]
+    if not b.empty: b = b[cols]
+    else: b = pd.DataFrame(columns=cols)
+    if not p.empty: p = p[cols]
+    else: p = pd.DataFrame(columns=cols)
+    df = pd.concat([b, p], ignore_index=True, sort=False)
+    if df.empty: return df
+    df["p_market"] = df["p_market"].fillna(df["american_odds"].map(american_to_prob))
+    df["side"] = df["side"].fillna("")
+    df["team_abbr"] = df["team_abbr"].where(df["team_abbr"].isin(ABBR_SET), df["home_abbr"])
+    df["description"] = df.apply(describe_row, axis=1)
+    df["leg_id"] = (df["event_id"].astype(str)+"|"+df["market_type"].astype(str)+"|"+
+                    df["team_abbr"].astype(str)+"|"+df["player_name"].astype(str)+"|"+
+                    df["side"].astype(str)+"|"+df["line"].astype(str))
+    df = df.drop_duplicates(subset=["leg_id"])
+    return df
 
-with st.expander("How to use", expanded=False):
-    st.write("1) Pick date → **Fetch Board**. 2) **Fetch Props** when ready (credits). 3) *(Optional)* Upload features with `player_name,q_proj`. 4) Filter & use tabs. 5) Download CSVs.")
+# --------------------------- App shell --------------------------------
+st.set_page_config(page_title="MLB Parlay Picker -- Clean", page_icon="⚾", layout="wide")
+st.markdown("<style>body{background:#fafafa}</style>", unsafe_allow_html=True)
+st.title("MLB Parlay Picker -- MVP")
 
-# Controls
-cols = st.columns(3)
-with cols[0]:
-    slate_date = st.date_input("Slate date", value=datetime.now().date())
-with cols[1]:
-    if st.button("Fetch Board (games + ML/RL)"):
-        try:
-            events = oddsapi_events(slate_date.strftime("%Y-%m-%d"))
-            board_json = oddsapi_odds_board(GAME_MARKETS)
-            board_df = normalize_board(board_json)
-            prob_df = mlb_probables(datetime.combine(slate_date, datetime.min.time()))
-            st.session_state["events_df"] = events
-            st.session_state["board_df"] = board_df
-            st.session_state["prob_df"] = prob_df
-            st.success(f"Fetched board: {len(board_df)} lines across {events['event_id'].nunique()} games.")
-        except Exception as e:
-            st.error(f"Board fetch failed: {e}")
-with cols[2]:
-    if st.button("Fetch Props (uses credits)"):
-        try:
-            props_json = oddsapi_odds_props_chunked(PROPS_MARKETS, chunk_size=3)
-            props_df = normalize_props(props_json)
-            if props_df.empty:
-                st.warning("Props response was empty (check plan/markets/time).")
-            st.session_state["props_df"] = props_df
-            st.success(f"Fetched props: {len(props_df)} rows.")
-        except Exception as e:
-            st.error(f"Props fetch error: {e}")
+ss = st.session_state
+for k, default in [
+    ("events_df", None), ("board_df", None), ("props_df", None), ("rates_df", None),
+    ("picks", {}), ("lock_data", False),
+    ("last_snapshot_bytes", None), ("last_snapshot_path", None), ("last_snapshot_ts", None),
+    ("auto_snapshot", True),
+]:
+    ss.setdefault(k, default)
 
-# Uploads
-u1, u2 = st.columns(2)
-with u1:
-    up_board = st.file_uploader("Upload Board CSV (optional)", type=["csv"])
-    if up_board:
-        st.session_state["board_df"] = pd.read_csv(up_board)
-        st.success(f"Loaded board CSV: {len(st.session_state['board_df'])} rows.")
-with u2:
-    up_feat = st.file_uploader("Upload Features CSV (player_name,q_proj)", type=["csv"])
-    if up_feat:
-        st.session_state["features_df"] = pd.read_csv(up_feat)
-        st.success(f"Loaded features CSV: {len(st.session_state['features_df'])} rows.")
+# Sidebar -- Data fetch & persistence
+with st.sidebar:
+    st.subheader("Data")
+    st.caption("Manual fetch keeps credits under your control.")
+    colA, colB = st.columns(2)
+    with colA:
+        btn_events = st.button("Fetch events", disabled=ss["lock_data"])
+        btn_board  = st.button("Fetch board",  disabled=ss["lock_data"])
+    with colB:
+        btn_props  = st.button("Fetch props",  disabled=ss["lock_data"])
+        btn_rates  = st.button("Opp. rates",   disabled=ss["lock_data"])
 
-# Downloads after fetch
-dl1, dl2 = st.columns(2)
-bd = get_session_df("board_df")
-if not bd.empty:
-    dl1.download_button("Download Board CSV", bd.to_csv(index=False).encode(), file_name=f"board_{slate_date}.csv", mime="text/csv")
-pdn = get_session_df("props_df")
-if not pdn.empty:
-    dl2.download_button("Download Props CSV", pdn.to_csv(index=False).encode(), file_name=f"props_{slate_date}.csv", mime="text/csv")
+    st.markdown("---")
+    st.subheader("Persistence")
+    ss["auto_snapshot"] = st.toggle("Auto‑save snapshot after fetch", value=ss["auto_snapshot"])
+    ss["lock_data"] = st.toggle("🔒 Data Lock (prevent overwrite)", value=ss["lock_data"])
+
+    colS1, colS2 = st.columns(2)
+    with colS1:
+        save_snap = st.button("Save snapshot (server & download)")
+    with colS2:
+        restore_snap = st.button("Restore last server snapshot")
+    up_zip = st.file_uploader("Load snapshot (zip with events/board/props/rates)", type=["zip"])
+
+    # Show latest auto-snapshot download if available
+    if ss.get("last_snapshot_bytes"):
+        st.download_button(
+            "Download latest auto‑snapshot",
+            data=ss["last_snapshot_bytes"],
+            file_name=f"mlb_snapshot_latest.zip",
+            mime="application/zip",
+            key="dl_latest_auto"
+        )
+        if ss.get("last_snapshot_ts"):
+            st.caption(f"Auto‑saved: {ss['last_snapshot_ts']}")
+
+    if save_snap:
+        bytes_zip = save_snapshot_to_zip(ss.get("events_df"), ss.get("board_df"), ss.get("props_df"), ss.get("rates_df"))
+        ss["last_snapshot_bytes"] = bytes_zip
+        path = write_server_snapshot(bytes_zip)
+        ss["last_snapshot_path"] = path
+        ss["last_snapshot_ts"] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        st.success(f"Snapshot saved: {path}")
+        st.download_button("Download snapshot zip", data=bytes_zip, file_name=f"mlb_snapshot_{datetime.now().strftime('%Y%m%d_%H%M')}.zip", mime="application/zip", key="dl_manual_snap")
+
+    if restore_snap:
+        p = last_server_snapshot_path()
+        if p and os.path.exists(p):
+            with open(p, "rb") as f:
+                E,B,P,R = load_snapshot_from_zip(f)
+            if not ss["lock_data"]:
+                ss["events_df"], ss["board_df"], ss["props_df"], ss["rates_df"] = E,B,P,R
+            st.success(f"Restored snapshot: {p}")
+        else:
+            st.warning("No server snapshot found.")
+
+    if up_zip is not None:
+        E,B,P,R = load_snapshot_from_zip(up_zip)
+        if not ss["lock_data"]:
+            ss["events_df"], ss["board_df"], ss["props_df"], ss["rates_df"] = E,B,P,R
+        st.success("Loaded uploaded snapshot.")
+
+# Handle fetch buttons (only if not locked) + AUTO‑SAVE after each fetch
+def _auto_after_fetch(label: str):
+    if ss["auto_snapshot"]:
+        path = autosave_snapshot(ss)
+        if path:
+            st.sidebar.success(f"Auto‑saved after {label} → {os.path.basename(path)}")
+        else:
+            st.sidebar.warning(f"Auto‑save after {label} failed.")
+
+if btn_events and not ss["lock_data"]:
+    ss["events_df"] = fetch_events()
+    _auto_after_fetch("events")
+
+if btn_board and not ss["lock_data"]:
+    ss["board_df"] = fetch_board()
+    _auto_after_fetch("board")
+
+if btn_props and not ss["lock_data"]:
+    eids = ss["events_df"]["event_id"].tolist() if isinstance(ss.get("events_df"), pd.DataFrame) and not ss["events_df"].empty else []
+    ek = tuple(sorted(set(_s(e) for e in eids)))
+    mk = tuple(sorted(set(_s(m) for m in PROP_MARKETS)))
+    ss["props_df"] = fetch_props_by_events_cached(ek, mk)  # cache avoids re‑hits if same args+TTL
+    _auto_after_fetch("props")
+
+if btn_rates and not ss["lock_data"]:
+    ss["rates_df"] = get_opponent_rates()
+    _auto_after_fetch("opponent rates")
+
+# Current dataframes
+events_df = ss["events_df"] if isinstance(ss["events_df"], pd.DataFrame) else pd.DataFrame()
+board_df  = ss["board_df"]  if isinstance(ss["board_df"], pd.DataFrame)  else pd.DataFrame()
+props_df  = ss["props_df"]  if isinstance(ss["props_df"], pd.DataFrame)  else pd.DataFrame()
+rates_df  = ss["rates_df"]  if isinstance(ss["rates_df"], pd.DataFrame)  else get_opponent_rates()
 
 # Build pool
-events_df = get_session_df("events_df")
-board_df  = get_session_df("board_df")
-props_df  = get_session_df("props_df")
-prob_df   = get_session_df("prob_df")
+def _clean_market_text(mkey:str) -> str:
+    mkey = _s(mkey)
+    if "strikeout" in mkey: return "Ks"
+    if "walk" in mkey and "pitcher" in mkey: return "BB"
+    if "outs" in mkey and "pitcher" in mkey: return "Outs"
+    if "record_a_win" in mkey: return "Win"
+    return mkey
 
-# Opponent rates (cached)
-if st.session_state.get("rates_df") is None:
+def _pretty_category(mkey:str) -> str:
+    mkey = _s(mkey)
+    if "strikeout" in mkey: return "Pitcher Ks"
+    if "walks" in mkey and "pitcher" in mkey: return "Pitcher BB"
+    if "outs" in mkey and "pitcher" in mkey: return "Pitcher Outs"
+    if "record_a_win" in mkey: return "Pitcher Win"
+    return mkey
+
+def describe_row(row: pd.Series) -> str:
+    mtext = _clean_market_text(row.get("market_type",""))
+    side = _s(row.get("side")).title() if row.get("side") else ""
+    line = row.get("line")
+    matchup = row.get("matchup") or f"{_cap3(row.get('away_abbr'))}@{_cap3(row.get('home_abbr'))}"
+    team = _cap3(row.get("team_abbr"))
+    if row.get("player_name"):
+        nm = first_init_last(row["player_name"])
+        if line not in (None, float("nan")):
+            bet = f"{nm} ({team or '--'}) {side} {line:g} {mtext}"
+        else:
+            bet = f"{nm} ({team or '--'}) {side} {mtext}"
+    else:
+        if row.get("market_type") == "Moneyline":
+            bet = f"{team} ML ({matchup})"
+        else:
+            bet = f"{team} {row.get('line',0):+0.1f} ({matchup})" if row.get("line") is not None else f"{team} RL ({matchup})"
+    return bet
+
+def build_pool(board_df: pd.DataFrame, props_df: pd.DataFrame) -> pd.DataFrame:
+    b = board_df.copy() if isinstance(board_df, pd.DataFrame) else pd.DataFrame()
+    p = props_df.copy() if isinstance(props_df, pd.DataFrame) else pd.DataFrame()
+    cols = ["event_id","market_type","team_abbr","player_name","side","line","american_odds","decimal_odds","p_market","home_abbr","away_abbr","category","matchup"]
+    if not b.empty: b = b[cols]
+    else: b = pd.DataFrame(columns=cols)
+    if not p.empty: p = p[cols]
+    else: p = pd.DataFrame(columns=cols)
+    df = pd.concat([b, p], ignore_index=True, sort=False)
+    if df.empty: return df
+    df["p_market"] = df["p_market"].fillna(df["american_odds"].map(american_to_prob))
+    df["side"] = df["side"].fillna("")
+    df["team_abbr"] = df["team_abbr"].where(df["team_abbr"].isin(ABBR_SET), df["home_abbr"])
+    df["description"] = df.apply(describe_row, axis=1)
+    df["leg_id"] = (df["event_id"].astype(str)+"|"+df["market_type"].astype(str)+"|"+
+                    df["team_abbr"].astype(str)+"|"+df["player_name"].astype(str)+"|"+
+                    df["side"].astype(str)+"|"+df["line"].astype(str))
+    df = df.drop_duplicates(subset=["leg_id"])
+    return df
+
+pool_base = build_pool(board_df, props_df)
+
+# Heuristic → calibration (crash‑safe)
+def enhanced_q(df: pd.DataFrame, use_weather=True, use_park=True, use_form=True) -> pd.DataFrame:
+    if df is None or df.empty: return df.copy()
+    K9, BB9, IP0 = 8.5, 3.3, 5.8
+    opp_rates = get_opponent_rates().set_index("team_abbr")
+
+    q_list, why = [], []
+    for _, r in df.iterrows():
+        m = _s(r.get("market_type"))
+        side = _s(r.get("side")).lower()
+        line = r.get("line")
+        team = _cap3(r.get("team_abbr") or r.get("home_abbr"))
+        p_mkt = r.get("p_market") or 0.5
+
+        if "strikeout" in m:
+            lam = IP0 * (K9/9.0); p0 = _over_prob(line, lam); p0 = p0 if side=="over" else (1-p0)
+        elif "walks" in m and "pitcher" in m:
+            lam = IP0 * (BB9/9.0); p0 = _over_prob(line, lam); p0 = p0 if side=="over" else (1-p0)
+        elif "outs" in m and "pitcher" in m:
+            mu, sd = IP0*3.0, 3.0
+            if line is None: p0 = p_mkt
+            else:
+                z0 = (float(line) - 0.5 - mu)/sd
+                p_over = 0.5*(1 - math.erf(z0/math.sqrt(2)))
+                p0 = p_over if side=="over" else (1-p_over)
+        elif "record_a_win" in m:
+            p0 = 0.55 if side in ("yes","over") else 0.45
+        else:
+            p0 = p_mkt
+        z = _logit(p0); bits = []
+
+        ok = float(opp_rates.loc[team,"opp_k_pct"]) if team in opp_rates.index else 0.22
+        ob = float(opp_rates.loc[team,"opp_bb_pct"]) if team in opp_rates.index else 0.08
+        if "strikeout" in m:
+            z += 0.60*((ok-0.22)/0.10); bits.append(f"oppK {ok:.0%}")
+        if "walks" in m and "pitcher" in m:
+            z += 0.60*((ob-0.08)/0.10); bits.append(f"oppBB {ob:.0%}")
+
+        if use_park:
+            pf = PARK.get(team, {"k":1.0,"bb":1.0})
+            if "strikeout" in m:
+                z += 0.30*((pf["k"]-1.0)/0.10); bits.append(f"ParkK×{pf['k']:.2f}")
+            if "walks" in m and "pitcher" in m:
+                z += 0.20*((pf["bb"]-1.0)/0.10); bits.append(f"ParkBB×{pf['bb']:.2f}")
+
+        if use_weather and (("strikeout" in m) or ("outs" in m and "pitcher" in m)):
+            wf = get_weather_factor(team)
+            z += 0.15*((wf-1.0)*2.0); bits.append(f"Wind×{wf:.2f}")
+
+        if use_form and _s(r.get("player_name")):
+            f = pitcher_last5(r["player_name"])
+            if f:
+                if "strikeout" in m and f.get("k9_l5"): z += 0.35*((f["k9_l5"]-K9)/2.0); bits.append(f"K9L5 {f['k9_l5']:.1f}")
+                if "walks" in m and "pitcher" in m and f.get("bb9_l5"): z += -0.35*((f["bb9_l5"]-BB9)/2.0); bits.append(f"BB9L5 {f['bb9_l5']:.1f}")
+                if "outs" in m and "pitcher" in m and f.get("ip_l5"): z += 0.25*((f["ip_l5"]-IP0)); bits.append(f"IPL5 {f['ip_l5']:.1f}")
+
+        q_list.append(1.0/(1.0+math.exp(-z)))
+        why.append(" • ".join(bits))
+    out = df.copy()
+    out["q_enh"] = q_list
+    out["q_notes"] = why
+    return out
+
+def calibrate_vs_market(df: pd.DataFrame, lam: float=0.25) -> pd.DataFrame:
+    if df is None: return pd.DataFrame()
+    if df.empty:
+        df = df.copy()
+        if "p_market" not in df.columns: df["p_market"] = []
+        if "q_enh" not in df.columns: df["q_enh"] = []
+        df["q_final"] = df.get("q_enh", df.get("p_market", 0.5))
+        return df
+    p = df["q_enh"].fillna(df["p_market"].fillna(0.5)).clip(1e-6, 1-1e-6).astype(float)
+    m = df["p_market"].fillna(0.5).clip(1e-6, 1-1e-6).astype(float)
+    z = (1-lam)*p.map(lambda x: math.log(x/(1-x))) + lam*m.map(lambda x: math.log(x/(1-x)))
+    df = df.copy()
+    df["q_final"] = z.map(lambda x: 1.0/(1.0+math.exp(-x)))
+    return df
+
+def ensure_prob_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None: return pd.DataFrame()
+    df = df.copy()
+    if "p_market" not in df.columns:
+        df["p_market"] = df["american_odds"].map(american_to_prob)
+    else:
+        df["p_market"] = df["p_market"].fillna(df["american_odds"].map(american_to_prob))
+    if "q_enh" not in df.columns:
+        df["q_enh"] = df["p_market"].fillna(0.5)
+    if "q_final" not in df.columns:
+        df["q_final"] = df["q_enh"].fillna(df["p_market"]).fillna(0.5)
+    return df
+
+enh_raw = enhanced_q(pool_base, use_weather=True, use_park=True, use_form=True) if not pool_base.empty else pool_base.copy()
+enh_cal = calibrate_vs_market(enh_raw, lam=0.25)
+enh = ensure_prob_columns(enh_cal)
+if not enh.empty:
+    enh["edge"] = enh["q_final"].fillna(0.5) - enh["p_market"].fillna(0.5)
+
+# ===================== High-Odds Parlay Builder (8–9 legs) =====================
+import math
+import re
+
+ALLOWED_MARKETS = {
+    "Pitcher Win", "Pitcher Wins", "pitcher_record_a_win",
+    "Pitcher Outs", "pitcher_outs",
+    "Pitcher Strikeouts", "pitcher_strikeouts",
+    "Pitcher Walks", "pitcher_walks",
+}
+
+def _col(df, names, default=None):
+    for n in names:
+        if n in df.columns:
+            return df[n]
+    return default
+
+def _to_decimal_from_american(a):
     try:
-        st.session_state["rates_df"] = mlb_team_rates_last_days(days=21)
+        a = float(a)
+        if a >= 0:
+            return 1 + (a / 100.0)
+        else:
+            return 1 + (100.0 / abs(a))
     except Exception:
-        st.session_state["rates_df"] = pd.DataFrame()
-rates_df = get_session_df("rates_df")
-feat_df  = get_session_df("features_df")
+        return math.nan
 
-pool_base = build_pool(board_df, props_df, events_df, prob_df, rates_df, feat_df)
+def _to_prob_from_decimal(d):
+    try:
+        d = float(d)
+        return 1.0 / d if d > 1 else math.nan
+    except Exception:
+        return math.nan
 
-# Filters
-st.markdown("### Filters")
+def _to_prob_from_percentish(x):
+    # accepts 0.62, "62%", "0.62", 62
+    try:
+        if isinstance(x, str) and x.strip().endswith("%"):
+            return float(x.strip().replace("%",""))/100.0
+        xv = float(x)
+        return xv/100.0 if xv > 1.01 else xv
+    except Exception:
+        return math.nan
 
-games_det = []
-if not events_df.empty:
-    for _, r in events_df.iterrows():
-        games_det.append(f"{fmt_team(r['away_abbr'])}@{fmt_team(r['home_abbr'])}")
+def _pct(x): 
+    return f"{round(100*x):d}%" if isinstance(x,(float,int)) and x==x else "--"
 
-select_all_games = st.checkbox("Select all games", value=True)
-games_pick = st.multiselect("Games", games_det, default=(games_det if select_all_games else []))
+def _parse_desc_for_player_team(desc):
+    # tries formats like "A. Gray (STL) O5.5 Ks" or "Over 5.5 Ks -- C. Rodon (NYY)"
+    if not isinstance(desc, str): return ("", "")
+    m = re.search(r"([A-Z]\.\s*[A-Za-z\-']+)\s*\(([A-Z]{2,3})\)", desc)
+    if m: return (m.group(1).strip(), m.group(2).strip())
+    # fallback: ALLCAPS team code in parentheses anywhere
+    m2 = re.search(r"\(([A-Z]{2,3})\)", desc)
+    return ("", m2.group(1)) if m2 else ("","")
 
-teams_all = sorted(set([fmt_team(x) for x in pool_base["team_abbr"].dropna().unique().tolist()]))
-select_all_teams = st.checkbox("Select all teams", value=True)
-teams_pick = st.multiselect("Teams", teams_all, default=(teams_all if select_all_teams else []))
+def normalize_pool_columns(df):
+    df = df.copy()
+    # Base odds
+    if "american_odds" not in df.columns:
+        if "Odds" in df.columns: df["american_odds"] = df["Odds"]
+        elif "american" in df.columns: df["american_odds"] = df["american"]
+        else: df["american_odds"] = math.nan
+    # Decimal odds
+    if "decimal_odds" not in df.columns:
+        if "Dec" in df.columns: df["decimal_odds"] = df["Dec"]
+        else: df["decimal_odds"] = df["american_odds"].apply(_to_decimal_from_american)
+    # Market probs
+    if "p_market" not in df.columns:
+        if "Market" in df.columns: df["p_market"] = df["Market"].apply(_to_prob_from_percentish)
+        else: df["p_market"] = df["decimal_odds"].apply(_to_prob_from_decimal)
+    # Model probs
+    if "q_model" not in df.columns:
+        if "q" in df.columns: df["q_model"] = df["q"].apply(_to_prob_from_percentish)
+        elif "Model q %" in df.columns: df["q_model"] = df["Model q %"].apply(_to_prob_from_percentish)
+        else: df["q_model"] = math.nan
+    # Category
+    if "category" not in df.columns:
+        if "market_type" in df.columns: df["category"] = df["market_type"]
+        else:
+            df["category"] = _col(df, ["Category","Market","type"], "")
+    # Side/Line
+    if "side" not in df.columns:
+        df["side"] = _col(df, ["side","Side"], "")
+    if "line" not in df.columns:
+        df["line"] = _col(df, ["line","Line"], "")
+    # Player/Team
+    if "player_name" not in df.columns:
+        df["player_name"] = _col(df, ["player","Player","name"], "")
+        # parse from description if still blank
+        from_desc = df.get("description")
+        if from_desc is not None:
+            extra = from_desc.apply(_parse_desc_for_player_team).apply(lambda t: t[0])
+            df.loc[df["player_name"].eq(""), "player_name"] = extra
+    if "team_abbr" not in df.columns:
+        df["team_abbr"] = _col(df, ["team","Team","team_abbr"], "")
+        if "description" in df.columns:
+            t2 = df["description"].apply(_parse_desc_for_player_team).apply(lambda t: t[1])
+            df.loc[df["team_abbr"].eq(""), "team_abbr"] = t2
+    # Game / pitcher key
+    if "game_id" not in df.columns:
+        df["game_id"] = _col(df, ["game_id","Game","match_id"], "")
+    df["player_key"] = df["player_name"].fillna("").str.replace(r"\.","", regex=True).str.strip().str.lower()
+    # Edge/EV
+    if "edge" not in df.columns:
+        df["edge"] = df["q_model"] - df["p_market"]
+    if "ev" not in df.columns:
+        df["ev"] = df["q_model"] * (df["decimal_odds"] - 1) - (1 - df["q_model"])
+    return df
 
-cat_options = ["Moneyline","Run Line","Pitcher Ks","Pitcher Walks","Pitcher Hits Allowed","Pitcher ER","Pitcher Outs","Win"]
-def cat_from_row(r):
-    if r["category"] in ("Moneyline","Run Line"): return r["category"]
-    mk = r["market_key"]
-    if "strikeouts" in mk: return "Pitcher Ks"
-    if "walks" in mk: return "Pitcher Walks"
-    if "hits_allowed" in mk: return "Pitcher Hits Allowed"
-    if "earned_runs" in mk: return "Pitcher ER"
-    if "outs" in mk: return "Pitcher Outs"
-    if "record_a_win" in mk: return "Win"
-    return r["category"]
+def is_allowed_market(cat: str):
+    if not isinstance(cat,str): return False
+    c = cat.strip().lower()
+    for k in ALLOWED_MARKETS:
+        if c == k.lower():
+            return True
+    # soft mapping for your internal strings
+    # e.g., "Pitcher Ks" -> Pitcher Strikeouts
+    if "strikeout" in c: return True
+    if "outs" in c: return True
+    if "walk" in c: return True
+    if "win" in c: return True
+    return False
 
-pool = pool_base.copy()
-if not pool.empty:
-    pool["ui_cat"] = pool.apply(cat_from_row, axis=1)
+def variance_penalty(row):
+    desc = str(row.get("description","")).upper()
+    # avoid Coors/altitude chaos unless it's a prop with big edge
+    if "COL@STL" in desc or "COL@" in desc or "@COL" in desc or "COORS" in desc:
+        return 8.0
+    return 0.0
 
-cat_pick = st.multiselect("Categories", cat_options, default=["Moneyline","Run Line"])
-odds_min, odds_max = st.slider("American odds", -700, 700, (-700, 700), step=5)
+def value_boost(american):
+    try:
+        a = float(american)
+        # encourage plus money modestly; don’t over-reward giant dogs
+        return 0.20 * (a/100.0) if a > 0 else 0.10 * (-a/150.0)
+    except Exception:
+        return 0.0
 
-def row_game(r):
-    a = fmt_team(r.get("opp_abbr")); h = fmt_team(r.get("team_abbr"))
-    if r.get("is_home") is True:  return f"{a}@{h}"
-    if r.get("is_home") is False: return f"{h}@{a}"
-    return f"{a}@{h}"
+def parlay_score(row):
+    q = float(row.get("q_model", math.nan))
+    p = float(row.get("p_market", math.nan))
+    a = row.get("american_odds", 0)
+    if not (q==q and p==p): return -1e9
+    edge = (q - p) * 100.0
+    conf = (q - 0.50) * 100.0
+    vb   = value_boost(a) * 100.0
+    pen  = variance_penalty(row)
+    return edge + 0.75*conf + vb - pen
 
-if not pool.empty:
-    pool["game_key"] = pool.apply(row_game, axis=1)
-    pool = pool[
-        pool["american_odds"].between(odds_min, odds_max, inclusive="both") &
-        pool["game_key"].isin(games_pick if games_pick else pool["game_key"].unique()) &
-        pool["team_abbr"].apply(lambda x: fmt_team(x) in (teams_pick if teams_pick else teams_all)) &
-        pool["ui_cat"].isin(cat_pick if cat_pick else cat_options)
-    ].reset_index(drop=True)
+def build_high_odds_parlay(pool, target_legs=9, min_q=0.60, min_edge=0.0):
+    df = normalize_pool_columns(pool)
+    df = df[df["category"].apply(is_allowed_market)].copy()
+    # odds guardrails per market
+    def ok_odds(row):
+        a = row.get("american_odds", -9999)
+        cat = str(row.get("category","")).lower()
+        try: a=float(a)
+        except: return False
+        if "win" in cat:
+            return -180 <= a <= +180
+        # props can be a little wider
+        return -250 <= a <= +220
+    df = df[df.apply(ok_odds, axis=1)]
+    df = df[(df["q_model"] >= min_q) & (df["edge"] >= min_edge)].copy()
+    if df.empty:
+        return [], {}
+    # Rank by score, preferring Pitcher Win first
+    df["score"] = df.apply(parlay_score, axis=1)
+    # Diversity constraints
+    used_games = set()
+    used_pitchers = set()
+    picks = []
 
-st.markdown("#### Coverage (from MLB schedule) -- games detected")
-st.caption(", ".join(games_det) if games_det else "No games found for this date.")
+    # Aim for 4-5 Pitcher Win YES first
+    wins = df[df["category"].str.lower().str.contains("win")].sort_values("score", ascending=False)
+    for _, r in wins.iterrows():
+        g = r.get("game_id",""); pk = r.get("player_key","")
+        if g in used_games or pk in used_pitchers: continue
+        picks.append(r)
+        used_games.add(g); used_pitchers.add(pk)
+        if len([x for x in picks if "win" in str(x.get("category","")).lower()]) >= 5: break
 
-# Tabs
-tabs = st.tabs(["Candidates", "Top 20", "Parlay Presets", "Alt Line Safety Board", "One‑Tap Ticket", "ML Winners & RL Locks", "Debug"])
+    # Fill remainder with Outs/Ks/Walks
+    rest = df[~df.index.isin([r.name for r in picks])].sort_values("score", ascending=False)
+    for _, r in rest.iterrows():
+        g = r.get("game_id",""); pk = r.get("player_key","")
+        if g in used_games or pk in used_pitchers: continue
+        picks.append(r)
+        used_games.add(g); used_pitchers.add(pk)
+        if len(picks) >= target_legs: break
+
+    # Compute parlay metrics
+    if not picks:
+        return [], {}
+
+    import numpy as np
+    P = np.prod([float(x.get("q_model",0.0)) for x in picks])
+    D = np.prod([float(x.get("decimal_odds",1.0)) for x in picks])
+    EV = P * (D - 1) - (1 - P)
+
+    # Card formatting
+    def fmt_card(r):
+        name = str(r.get("player_name","")).strip()
+        team = str(r.get("team_abbr","")).strip().upper()[:3]
+        # Shorten first name to initial if full
+        if name and "." not in name and " " in name:
+            name = f"{name.split()[0][0]}. {' '.join(name.split()[1:])}"
+        # Try to infer a compact bet label
+        cat = str(r.get("category",""))
+        side = str(r.get("side","")).capitalize()
+        line = r.get("line","")
+        # Fallbacks from description if needed
+        if not side or side.lower() not in {"over","under","yes","no"}:
+            desc = str(r.get("description",""))
+            m = re.search(r"\b(Over|Under|Yes|No)\b", desc, re.I)
+            if m: side = m.group(1).capitalize()
+        if not line or (isinstance(line,str) and not line.strip()):
+            desc = str(r.get("description",""))
+            m = re.search(r"([0-9]+(\.[05])?)", desc)
+            if m: line = m.group(1)
+        label = ""
+        lc = cat.lower()
+        if "strikeout" in lc:
+            label = "Ks"
+        elif "outs" in lc:
+            label = "Outs"
+        elif "walk" in lc:
+            label = "BB"
+        elif "win" in lc:
+            label = "Win"
+        else:
+            label = cat
+        odds = int(float(r.get("american_odds",0)))
+        q = float(r.get("q_model", math.nan)); p = float(r.get("p_market", math.nan))
+        # Build chip line
+        chips = f"Odds {odds:+d} · q {_pct(q)} · Market {_pct(p)} · Edge {_pct(q-p)}"
+        # Headline
+        who = (name if name else "").strip()
+        who = who if who else "(?)"
+        t = f" ({team})" if team else ""
+        head = f"{who}{t} -- {side} {line} {label}" if label!="Win" else f"{who}{t} -- Win {side}"
+        return head, chips
+
+    cards = []
+    for r in picks:
+        h, c = fmt_card(r)
+        cards.append((h,c))
+
+    summary = {
+        "legs": len(picks),
+        "hit_prob_est": P,
+        "decimal_combined": D,
+        "american_combined": (D-1)*100 if D>1 else 0,
+        "ev_est": EV,
+        "note": "Greedy high-odds builder: 4–5 Wins first, then Outs/Ks/Walks; q>=60%, edge>=0; no duplicate pitcher/game; Coors penalized."
+    }
+    return cards, summary
+
+# ---------- Streamlit UI hook (put this where you render tabs/buttons) ----------
+if "pool_base" in globals():
+    _cards, _sum = build_high_odds_parlay(pool_base, target_legs=9, min_q=0.60, min_edge=0.00)
+    with st.expander("High‑Odds Parlay (8–9 legs) -- auto‑built", expanded=True):
+        if _cards:
+            colA, colB, colC = st.columns([1,1,1])
+            colA.metric("Legs", _sum["legs"])
+            colB.metric("Est. Hit", f"{_pct(_sum['hit_prob_est'])}")
+            colC.metric("Est. American", f"{int(round(_sum['american_combined'])):+d}")
+            st.caption(_sum["note"])
+            for i,(h,c) in enumerate(_cards,1):
+                st.markdown(f"**{i}. {h}**")
+                st.caption(c)
+        else:
+            st.info("No qualifying legs found with q≥60% and edge≥0. Widen odds or include more categories.")
+# ================================================================================
+# ===================== TOP-8 PARLAY PICKER (Pitcher-centric) =====================
+import math, re
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+ALLOWED_MARKETS = {
+    "Pitcher Win", "Pitcher Wins", "pitcher_record_a_win",
+    "Pitcher Outs", "pitcher_outs",
+    "Pitcher Strikeouts", "pitcher_strikeouts",
+    "Pitcher Walks", "pitcher_walks",
+}
+
+def _to_decimal_from_american(a):
+    try:
+        a = float(a)
+        return 1 + (a/100.0) if a >= 0 else 1 + (100.0/abs(a))
+    except Exception:
+        return math.nan
+
+def _to_prob_from_decimal(d):
+    try:
+        d = float(d)
+        return 1.0/d if d > 1 else math.nan
+    except Exception:
+        return math.nan
+
+def _to_prob_from_percentish(x):
+    try:
+        if isinstance(x, str) and x.strip().endswith("%"):
+            return float(x.strip().replace("%",""))/100.0
+        xv = float(x)
+        return xv/100.0 if xv > 1.01 else xv
+    except Exception:
+        return math.nan
+
+def _pct(x):
+    return f"{round(100*float(x))}%" if isinstance(x,(float,int)) or (isinstance(x,float) and x==x) else "--"
+
+def _parse_desc_for_player_team(desc):
+    if not isinstance(desc, str): return ("", "")
+    m = re.search(r"([A-Z]\.\s*[A-Za-z\-']+)\s*\(([A-Z]{2,3})\)", desc)
+    if m: return (m.group(1).strip(), m.group(2).strip())
+    m2 = re.search(r"\(([A-Z]{2,3})\)", desc)
+    return ("", m2.group(1)) if m2 else ("","")
+
+def normalize_pool_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = (df or pd.DataFrame()).copy()
+
+    # --- Odds ---
+    if "american_odds" not in df.columns:
+        if "Odds" in df.columns: df["american_odds"] = df["Odds"]
+        elif "american" in df.columns: df["american_odds"] = df["american"]
+        else: df["american_odds"] = math.nan
+
+    if "decimal_odds" not in df.columns:
+        if "Dec" in df.columns: df["decimal_odds"] = df["Dec"]
+        else: df["decimal_odds"] = df["american_odds"].apply(_to_decimal_from_american)
+
+    # --- Market prob ---
+    if "p_market" not in df.columns:
+        if "Market" in df.columns: df["p_market"] = df["Market"].apply(_to_prob_from_percentish)
+        else: df["p_market"] = df["decimal_odds"].apply(_to_prob_from_decimal)
+
+    # --- Model prob ---
+    if "q_model" not in df.columns:
+        for c in ["q","Model q %","q_model"]:
+            if c in df.columns:
+                df["q_model"] = df[c].apply(_to_prob_from_percentish) if c != "q_model" else df[c]
+                break
+        if "q_model" not in df.columns: df["q_model"] = math.nan
+
+    # --- Category/Side/Line ---
+    if "category" not in df.columns:
+        if "market_type" in df.columns: df["category"] = df["market_type"]
+        else:
+            for c in ["Category","Market","type"]:
+                if c in df.columns: df["category"] = df[c]; break
+            if "category" not in df.columns: df["category"] = ""
+
+    if "side" not in df.columns: df["side"] = df.get("side","")
+    if "line" not in df.columns: df["line"] = df.get("line","")
+
+    # --- Player/Team/Game ---
+    if "player_name" not in df.columns:
+        for c in ["player","Player","name"]:
+            if c in df.columns: df["player_name"] = df[c]; break
+        if "player_name" not in df.columns: df["player_name"] = ""
+        if "description" in df.columns:
+            df.loc[df["player_name"].eq(""), "player_name"] = df["description"].apply(_parse_desc_for_player_team).apply(lambda t: t[0])
+
+    if "team_abbr" not in df.columns:
+        for c in ["team_abbr","team","Team"]:
+            if c in df.columns: df["team_abbr"] = df[c]; break
+        if "team_abbr" not in df.columns: df["team_abbr"] = ""
+        if "description" in df.columns:
+            t2 = df["description"].apply(_parse_desc_for_player_team).apply(lambda t: t[1])
+            df.loc[df["team_abbr"].eq(""), "team_abbr"] = t2
+
+    if "game_id" not in df.columns:
+        for c in ["game_id","Game","match_id","event_id"]:
+            if c in df.columns: df["game_id"] = df[c]; break
+        if "game_id" not in df.columns: df["game_id"] = ""
+
+    # --- Keys/Edge/EV ---
+    df["player_key"] = df["player_name"].fillna("").astype(str)\
+        .str.replace(r"\.","", regex=True).str.strip().str.lower()
+    if "edge" not in df.columns:
+        df["edge"] = df["q_model"] - df["p_market"]
+    if "ev" not in df.columns:
+        df["ev"] = df["q_model"] * (df["decimal_odds"] - 1) - (1 - df["q_model"])
+
+    # De-dup noisy legs
+    dedup_keys = ["game_id","team_abbr","player_key","category","side","line","american_odds"]
+    dedup_keys = [k for k in dedup_keys if k in df.columns]
+    if dedup_keys:
+        df = df.drop_duplicates(subset=dedup_keys).reset_index(drop=True)
+
+    return df
+
+def is_allowed_market(cat: str) -> bool:
+    if not isinstance(cat,str): return False
+    c = cat.strip().lower()
+    if any(c == k.lower() for k in ALLOWED_MARKETS): return True
+    # Fuzzy map common labels
+    if "strikeout" in c or "outs" in c or "walk" in c or "win" in c:
+        return True
+    return False
+
+def value_boost(american):
+    try:
+        a = float(american)
+        return 0.20*(a/100.0) if a > 0 else 0.10*(-a/150.0)
+    except Exception:
+        return 0.0
+
+def variance_penalty(row):
+    # Light heuristic to avoid chaos spots; customize if you like.
+    desc = str(row.get("description","")).upper()
+    if "COORS" in desc or " @ COL" in desc or "COL@" in desc:
+        return 8.0
+    return 0.0
+
+def parlay_score(row):
+    q = float(row.get("q_model", math.nan))
+    p = float(row.get("p_market", math.nan))
+    a = row.get("american_odds", 0)
+    if not (q==q and p==p): return -1e9
+    edge = (q - p) * 100.0
+    conf = (q - 0.50) * 100.0
+    vb   = value_boost(a) * 100.0
+    pen  = variance_penalty(row)
+    # Prefer Pitcher Win slightly when edges tie
+    bonus = 2.0 if "win" in str(row.get("category","")).lower() else 0.0
+    return edge + 0.75*conf + vb + bonus - pen
+
+def build_top8(pool: pd.DataFrame, target_legs=8, min_q=0.60, min_edge=0.0):
+    df = normalize_pool_columns(pool)
+    if df.empty:
+        return [], {}
+
+    # Allowed markets & reasonable odds windows
+    def ok_row(r):
+        if not is_allowed_market(r.get("category","")): return False
+        try: a = float(r.get("american_odds", -9999))
+        except: return False
+        lc = str(r.get("category","")).lower()
+        if "win" in lc:      # keep in a tighter band
+            return -200 <= a <= +180
+        # props a bit wider
+        return -260 <= a <= +220
+
+    df = df[df.apply(ok_row, axis=1)].copy()
+    df = df[(df["q_model"] >= min_q) & (df["edge"] >= min_edge)].copy()
+    if df.empty:
+        return [], {}
+
+    df["score"] = df.apply(parlay_score, axis=1)
+
+    # Diversity: avoid duplicate pitcher/game
+    used_games, used_pitchers = set(), set()
+    picks = []
+
+    # 1) take up to 4–5 Pitcher Win YES first
+    wins = df[df["category"].str.lower().str.contains("win")].sort_values("score", ascending=False)
+    for _, r in wins.iterrows():
+        g, pk = r.get("game_id",""), r.get("player_key","")
+        if g in used_games or pk in used_pitchers: continue
+        picks.append(r); used_games.add(g); used_pitchers.add(pk)
+        if len([x for x in picks if "win" in str(x.get("category","")).lower()]) >= 5: break
+
+    # 2) fill the rest with Outs/Ks/Walks
+    rest = df[~df.index.isin([r.name for r in picks])].sort_values("score", ascending=False)
+    for _, r in rest.iterrows():
+        g, pk = r.get("game_id",""), r.get("player_key","")
+        if g in used_games or pk in used_pitchers: continue
+        picks.append(r); used_games.add(g); used_pitchers.add(pk)
+        if len(picks) >= target_legs: break
+
+    if not picks:
+        return [], {}
+
+    # Parlay math
+    P = float(np.prod([float(x.get("q_model",0.0)) for x in picks]))
+    D = float(np.prod([float(x.get("decimal_odds",1.0)) for x in picks]))
+    EV = P*(D - 1) - (1 - P)
+
+    # Card formatting
+    def fmt_card(r):
+        name = str(r.get("player_name","")).strip()
+        team = str(r.get("team_abbr","")).strip().upper()[:3]
+        if name and "." not in name and " " in name:
+            name = f"{name.split()[0][0]}. {' '.join(name.split()[1:])}"
+        cat  = str(r.get("category",""))
+        side = str(r.get("side","")).capitalize() if r.get("side","") else ""
+        line = str(r.get("line",""))
+        # Fallback from description
+        desc = str(r.get("description",""))
+        if not side or side.lower() not in {"over","under","yes","no"}:
+            m = re.search(r"\b(Over|Under|Yes|No)\b", desc, re.I)
+            if m: side = m.group(1).capitalize()
+        if not line.strip():
+            m = re.search(r"([0-9]+(\.[05])?)", desc)
+            if m: line = m.group(1)
+        label = ("Ks" if "strikeout" in cat.lower()
+                 else "Outs" if "outs" in cat.lower()
+                 else "BB" if "walk" in cat.lower()
+                 else "Win" if "win" in cat.lower()
+                 else cat)
+        odds = int(float(r.get("american_odds",0)))
+        q = float(r.get("q_model", math.nan)); p = float(r.get("p_market", math.nan))
+        chips = f"Odds {odds:+d} · q {_pct(q)} · Market {_pct(p)} · Edge {_pct(q-p)}"
+        who = name or "(?)"; t = f" ({team})" if team else ""
+        head = f"{who}{t} -- {('Win '+side) if label=='Win' else f'{side} {line} {label}'}"
+        return head, chips
+
+    cards = [fmt_card(r) for r in picks]
+    summary = {
+        "legs": len(picks),
+        "hit_prob_est": P,
+        "decimal_combined": D,
+        "american_combined": (D-1)*100 if D>1 else 0,
+        "ev_est": EV,
+        "note": "Top‑8: up to five Pitcher Wins, then Outs/Ks/Walks; q≥60%, edge≥0; no dup pitcher/game."
+    }
+    return cards, summary
+
+def render_top8_section(pool_base: pd.DataFrame):
+    st.subheader("Top 8 Picks -- Today")
+    if pool_base is None or (isinstance(pool_base, pd.DataFrame) and pool_base.empty):
+        st.info("No candidate legs in memory. Fetch or upload board/props first.")
+        return
+    cards, summ = build_top8(pool_base, target_legs=8, min_q=0.60, min_edge=0.00)
+    if not cards:
+        st.warning("No qualifying legs with current filters (q≥60%, edge≥0). Loosen odds/markets or refresh.")
+        return
+    c1,c2,c3 = st.columns(3)
+    c1.metric("Legs", summ["legs"])
+    c2.metric("Est. Hit", _pct(summ["hit_prob_est"]))
+    c3.metric("Est. American", f"{int(round(summ['american_combined'])):+d}")
+    st.caption(summ["note"])
+    lines = []
+    for i,(h,c) in enumerate(cards,1):
+        st.markdown(f"**{i}. {h}**")
+        st.caption(c)
+        lines.append(f"{i}. {h}  --  {c}")
+    st.text_area("Copy picks", value="\n".join(lines), height=180)
+# ===============================================================================
+
+# ---- UI hook: call this where you render tabs/sections (after pool_base exists)
+try:
+    if isinstance(pool_base, pd.DataFrame):
+        with st.expander("Auto Picks", expanded=True):
+            render_top8_section(pool_base)
+except NameError:
+    # pool_base not created yet; safe to ignore
+    pass
+#--------------------------- Filters & UI -----------------------------
+with st.expander("Filters", expanded=True):
+    games = sorted(set(enh["matchup"].dropna().tolist())) if not enh.empty else []
+    all_games = st.checkbox("Select all games", True, disabled=(len(games)==0))
+    sel_games = st.multiselect("Games", games, default=games if all_games else [])
+    teams = sorted(ABBR_SET)
+    all_teams = st.checkbox("Select all teams", True)
+    sel_teams = st.multiselect("Teams", teams, default=teams if all_teams else [])
+    cats = ["Moneyline","Run Line","Pitcher Ks","Pitcher BB","Pitcher Outs","Pitcher Win"]
+    sel_cats = st.multiselect("Categories", cats, default=cats)
+    od_min, od_max = st.slider("American odds", -700, 700, (-700, 700))
+
+f = enh.copy()
+if not f.empty:
+    if sel_games: f = f[f["matchup"].isin(sel_games)]
+    if sel_teams: f = f[f["team_abbr"].isin(sel_teams)]
+    if sel_cats:  f = f[f["category"].isin(sel_cats)]
+    f = f[(f["american_odds"].fillna(0).astype(float) >= od_min) &
+          (f["american_odds"].fillna(0).astype(float) <= od_max)]
+
+tabs = st.tabs(["Candidates","Top 20","My Picks","ML Winners & RL Locks","Downloads","Debug"])
 
 with tabs[0]:
-    if pool.empty:
-        st.info("No legs. Fetch board/props or relax filters.")
+    if f.empty:
+        st.info("No rows. Fetch data or relax filters.")
     else:
-        show = pool.rename(columns={"american_odds":"Odds","q_pct":"q %","p_pct":"Market %"})
-        st.dataframe(show[["description","category","Odds","q %","Market %","edge"]].sort_values(["edge","q %"], ascending=[False,False]),
-                     use_container_width=True, height=480)
+        show_cols = ["description","category","american_odds","q_final","p_market","edge"]
+        pretty = f[show_cols].rename(columns={"american_odds":"Odds","q_final":"q (model)","p_market":"Market %","edge":"Edge"})
+        pretty["q (model)"] = pretty["q (model)"].map(lambda x: pct(x,1))
+        pretty["Market %"] = pretty["Market %"].map(lambda x: pct(x,1))
+        pretty["Edge"] = pretty["Edge"].map(lambda x: f"{x:+.1%}")
+        st.dataframe(pretty, use_container_width=True, hide_index=True)
 
 with tabs[1]:
-    if pool.empty:
-        st.info("No legs.")
+    st.subheader("Top 20 (by edge, then odds)")
+    if f.empty:
+        st.info("No rows to rank.")
     else:
-        top = pool.sort_values(["edge","q_model","p_market"], ascending=[False,False,True]).head(20)
+        top = f.sort_values(["edge","q_final","american_odds"], ascending=[False,False,True]).head(20)
         for _, r in top.iterrows():
-            render_card(r)
-
-def preset_bucket(df: pd.DataFrame, legs: int, risk: str) -> pd.DataFrame:
-    if df.empty: return df
-    d = df.copy()
-    if risk == "Low":
-        d = d[(d["american_odds"] <= -150) & (d["q_model"] >= 0.60)]
-    elif risk == "Medium":
-        d = d[(d["american_odds"] > -150) & (d["american_odds"] <= +150) & (d["q_model"] >= 0.55)]
-    else:
-        d = d[(d["american_odds"] > +150) & (d["q_model"] >= 0.50)]
-    d = d.sort_values(["edge","q_model"], ascending=[False,False])
-    picks=[]; used=set()
-    for _, r in d.iterrows():
-        if len(picks) >= legs: break
-        g = r.get("game_key")
-        if g in used: continue
-        picks.append(r); used.add(g)
-    return pd.DataFrame(picks)
+            chips = []
+            if "alternate" in _s(r["market_type"]).lower():
+                chips.append("Alt")
+            chips.extend([
+                f"Odds {int(r['american_odds']) if pd.notna(r['american_odds']) else '--'}",
+                f"q {pct(r['q_final'])}",
+                f"Market {pct(r['p_market'])}",
+                f"Edge {r['edge']:+.1%}",
+            ])
+            checked = st.checkbox("Took ✓", key=f"take_{r['leg_id']}", value=(r["leg_id"] in ss["picks"]))
+            if checked:
+                ss["picks"][r["leg_id"]] = dict(
+                    time=datetime.now().isoformat(timespec="seconds"),
+                    leg_id=r["leg_id"], description=r["description"],
+                    american_odds=int(r["american_odds"]) if pd.notna(r["american_odds"]) else None,
+                    q_final=float(r["q_final"]), p_market=float(r["p_market"]),
+                    edge=float(r["edge"]), market_type=r["market_type"],
+                    team_abbr=r["team_abbr"], player_name=r.get("player_name"),
+                    side=r.get("side"), line=r.get("line"), matchup=r.get("matchup"),
+                )
+            else:
+                ss["picks"].pop(r["leg_id"], None)
+            # White card
+            st.markdown(
+                f"""
+                <div style="border:1px solid #eee;border-radius:14px;padding:14px 16px;background:#fff;">
+                    <div style="font-weight:600;margin-bottom:6px;">{r['description']}</div>
+                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;">
+                        {''.join([f'<span style="background:#f5f6f7;border:1px solid #eee;border-radius:999px;padding:3px 8px;font-size:12px;color:#111;">{c}</span>' for c in chips])}
+                    </div>
+                    <div style="color:#333;font-size:13px;line-height:1.35;margin-bottom:4px">{_s(r.get('q_notes',''))}</div>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
 with tabs[2]:
-    if pool.empty:
-        st.info("No legs.")
+    st.subheader("My Picks")
+    if not ss["picks"]:
+        st.info("No picks selected yet. Use the checkboxes in Top 20.")
     else:
-        st.markdown("**Parlay Presets (4 · 5 · 6 · 8 legs)**")
-        for L in [4,5,6,8]:
-            st.subheader(f"{L}-Leg")
-            for risk in ["Low","Medium","High"]:
-                dfp = preset_bucket(pool, L, risk)
-                dec = np.prod([american_to_decimal(x) or 1.0 for x in dfp["american_odds"]]) if not dfp.empty else 1.0
-                hit = np.prod([x for x in dfp["q_model"].fillna(0.0)]) if not dfp.empty else 0.0
-                st.markdown(f"<span class='pill'>Dec {dec:.2f}</span><span class='pill'>~Hit {hit*100:.1f}%</span><span class='pill'>Meets +600? {'✅' if dec>=7 else '❌'}</span>", unsafe_allow_html=True)
-                if dfp.empty:
-                    st.caption("No picks meet this bucket.")
-                else:
-                    for _, r in dfp.iterrows():
-                        render_card(r)
+        picks_df = pd.DataFrame(list(ss["picks"].values())).sort_values("time", ascending=False)
+        show = picks_df[["time","description","american_odds","q_final","p_market","edge"]].copy()
+        show = show.rename(columns={"american_odds":"Odds","q_final":"q (model)","p_market":"Market %","edge":"Edge"})
+        show["q (model)"] = show["q (model)"].map(lambda x: pct(x,1))
+        show["Market %"] = show["Market %"].map(lambda x: pct(x,1))
+        show["Edge"] = show["Edge"].map(lambda x: f"{x:+.1%}")
+        st.dataframe(show, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download My Picks CSV",
+            picks_df.to_csv(index=False).encode("utf-8"),
+            file_name=f"my_picks_{datetime.now().date().isoformat()}.csv",
+            mime="text/csv"
+        )
 
 with tabs[3]:
-    if pool.empty:
-        st.info("No legs.")
+    st.subheader("ML Winners & RL Locks")
+    ml = f[f["category"].isin(["Moneyline","Run Line"])].copy() if not f.empty else pd.DataFrame()
+    if ml.empty:
+        st.info("No ML/RL rows available.")
     else:
-        safety = pool[
-            (pool["ui_cat"].isin(["Pitcher Ks","Pitcher Walks","Pitcher Hits Allowed","Pitcher ER","Pitcher Outs"])) &
-            (pool["american_odds"] <= -180) & (pool["q_model"] >= 0.62)
-        ].sort_values(["q_model","edge"], ascending=[False,False]).head(30)
-        show = safety.rename(columns={"american_odds":"Odds","q_pct":"q %","p_pct":"Market %"})
-        st.dataframe(show[["description","Odds","q %","Market %"]], use_container_width=True, height=420)
+        show = ml[["description","american_odds","q_final","p_market","edge"]].rename(columns={
+            "american_odds":"Odds","q_final":"q (model)","p_market":"Market %","edge":"Edge"
+        })
+        show["q (model)"] = show["q (model)"].map(lambda x: pct(x,1))
+        show["Market %"] = show["Market %"].map(lambda x: pct(x,1))
+        show["Edge"] = show["Edge"].map(lambda x: f"{x:+.1%}")
+        st.dataframe(show, use_container_width=True, hide_index=True)
 
 with tabs[4]:
-    if pool.empty:
-        st.info("No legs.")
-    else:
-        one = pool[(pool["american_odds"] <= -150) & (pool["q_model"] >= 0.62)].sort_values(["edge","q_model"], ascending=[False,False])
-        one = preset_bucket(one, 4, "Low")
-        dec = np.prod([american_to_decimal(x) or 1.0 for x in one["american_odds"]]) if not one.empty else 1.0
-        hit = np.prod([x for x in one["q_model"].fillna(0.0)]) if not one.empty else 0.0
-        st.subheader("One‑Tap: 4 legs • Low")
-        st.caption(f"≈Hit {hit*100:.1f}% • Dec {dec:.2f} • Meets +600? {'✅' if dec>=7 else '❌'}")
-        for _, r in one.iterrows():
-            render_card(r)
+    st.subheader("Downloads")
+    def dl(df, label, fn):
+        if df is None or df.empty: st.button(label, disabled=True)
+        else:
+            st.download_button(label, df.to_csv(index=False).encode("utf-8"), file_name=fn, mime="text/csv")
+    today = datetime.now().date().isoformat()
+    dl(events_df, "Download Events CSV", f"events_{today}.csv")
+    dl(board_df,  "Download Board CSV",  f"board_{today}.csv")
+    dl(props_df,  "Download Props CSV",  f"props_{today}.csv")
 
 with tabs[5]:
-    ml = pool[pool["category"]=="Moneyline"].copy()
-    if ml.empty:
-        st.info("No moneyline legs.")
-    else:
-        ml["Lock?"] = (ml["q_model"] >= 0.65)
-        show = ml.rename(columns={"american_odds":"Odds","q_pct":"q %","p_pct":"Market %"})
-        st.dataframe(show[["description","Odds","q %","Market %","Lock?"]].sort_values(["Lock?","q %"], ascending=[False,False]),
-                     use_container_width=True, height=420)
-
-with tabs[6]:
-    st.json({
-        "events_df": len(get_session_df("events_df")),
-        "board_df": len(get_session_df("board_df")),
-        "props_df": len(get_session_df("props_df")),
-        "prob_df": len(get_session_df("prob_df")),
-        "rates_df": len(get_session_df("rates_df")),
-        "features_df": len(get_session_df("features_df")),
-        "has_api_key": bool(ODDS_API_KEY),
-    })
+    dbg = dict(
+        events_rows=len(events_df),
+        board_rows=len(board_df),
+        props_rows=len(props_df),
+        pool_rows=len(pool_base),
+        filtered_rows=len(f),
+        has_api_key=bool(api_key()),
+        markets=PROP_MARKETS,
+        lock_data=ss["lock_data"],
+        auto_snapshot=ss["auto_snapshot"],
+        last_server_snapshot=last_server_snapshot_path(),
+        last_snapshot_ts=ss.get("last_snapshot_ts"),
+    )
+    st.code(json.dumps(dbg, indent=2))
