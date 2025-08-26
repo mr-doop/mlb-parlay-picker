@@ -1,12 +1,12 @@
-# app.py — MLB Parlay Picker (clean UI + persistence + enhanced model)
+# app.py — MLB Parlay Picker (clean UI + grouped cards + persistence + enhanced model)
 # -----------------------------------------------------------------------------
 # - Manual fetch buttons (protect OddsAPI credits)
 # - Event/board from OddsAPI; props via /events/{id}/odds
 # - Alternates (Ks, BB) included
 # - Feature enrichment (opp K/BB, park, weather, pitcher form)
 # - Enhanced logistic model -> q_final; EV & Edge
-# - Top 20 cards with "Took ✓" + My Picks CSV
-# - High-odds 8–9 leg builder
+# - Grouped player-prop cards: one primary line + Alt Lines dropdown
+# - Top 20 remains (but grouped view is default for props); ML/RL separate
 # - Auto-snapshot to server (zip) and download/upload
 
 import os, re, json, math, glob, zipfile
@@ -19,7 +19,7 @@ import requests
 import streamlit as st
 
 from parlay.feature_join import (
-    apply_enhanced_model,
+    apply_enhanced_model,  # uses parlay/model_weights.json
 )
 
 # ---------------------------- Config ---------------------------------
@@ -94,7 +94,7 @@ BALLPARK_COORDS = {
     "NYY": (40.8296, -73.9262),"OAK":(37.7516,-122.2005),"PHI":(39.9057,-75.1665),
     "PIT": (40.4469, -80.0057),"SDP":(32.7073,-117.1566),"SFG":(37.7786,-122.3893),
     "SEA": (47.5914, -122.3325),"STL":(38.6226,-90.1928),"TBR":(27.7683,-82.6533),
-    "TEX": (32.7473, -97.0842),"TOR":(43.6414,-79.3894),"WSH":(38.8730,-77.0074),
+    "TEX": (32.7473, - 97.0842),"TOR":(43.6414,-79.3894),"WSH":(38.8730,-77.0074),
 }
 
 def api_key():
@@ -246,14 +246,6 @@ def autosave_snapshot(ss) -> str|None:
     return None
 
 # --------------------------- Fetchers --------------------------------
-def _stable_events_arg(event_ids):
-    if not event_ids: return tuple()
-    return tuple(sorted(set(_s(e) for e in event_ids)))
-
-def _stable_markets_arg(markets):
-    if not markets: return tuple()
-    return tuple(sorted(set(_s(m) for m in markets)))
-
 def _pretty_category(mkey:str) -> str:
     mkey = _s(mkey)
     if "strikeout" in mkey: return "Pitcher Ks"
@@ -318,8 +310,8 @@ def fetch_board() -> pd.DataFrame:
     return df.drop_duplicates(subset=["event_id","market_type","team_abbr","line","american_odds"])
 
 @st.cache_data(show_spinner=False, ttl=APP_TTL_MIN*60)
-def fetch_props_by_events_cached(event_key: tuple, markets_key: tuple) -> pd.DataFrame:
-    return _fetch_props_by_events_network(list(event_key), list(markets_key))
+def fetch_props_by_events_cached(event_ids_key: tuple, markets_key: tuple) -> pd.DataFrame:
+    return _fetch_props_by_events_network(list(event_ids_key), list(markets_key))
 
 def _fetch_props_by_events_network(event_ids:list[str], markets:list[str]) -> pd.DataFrame:
     key = api_key()
@@ -357,7 +349,7 @@ def _fetch_props_by_events_network(event_ids:list[str], markets:list[str]) -> pd
                     ))
     return pd.DataFrame(rows)
 
-# ----------------------- Description / Cards --------------------------
+# ----------------------- Description / Pool --------------------------
 def _clean_market_text(mkey:str) -> str:
     mkey = _s(mkey)
     if "strikeout" in mkey: return "Ks"
@@ -403,7 +395,6 @@ def build_pool(board_df: pd.DataFrame, props_df: pd.DataFrame) -> pd.DataFrame:
     df["team_abbr"] = df["team_abbr"].where(df["team_abbr"].isin(ABBR_SET), df["home_abbr"])
     df["description"] = df.apply(describe_row, axis=1)
     df["player_key"] = df["player_name"].fillna("").str.replace(r"\.","", regex=True).str.strip().str.lower()
-    # De-dup noisy rows
     df["leg_id"] = (df["event_id"].astype(str)+"|"+df["market_type"].astype(str)+"|"+
                     df["team_abbr"].astype(str)+"|"+df["player_name"].astype(str)+"|"+
                     df["side"].astype(str)+"|"+df["line"].astype(str)+"|"+df["american_odds"].astype(str))
@@ -525,7 +516,7 @@ def enrich_features(pool: pd.DataFrame) -> pd.DataFrame:
     df["opp_k_pct"]  = df["opp_k_pct"].fillna(0.22)
     df["opp_bb_pct"] = df["opp_bb_pct"].fillna(0.08)
 
-    # Park factors
+    # Park factors (ballpark proxy = team home for our purposes)
     df["park_k_factor"]  = df["team_abbr"].map(lambda t: PARK.get(_cap3(t), {"k":1.0})["k"]).fillna(1.0)
     df["park_bb_factor"] = df["team_abbr"].map(lambda t: PARK.get(_cap3(t), {"bb":1.0})["bb"]).fillna(1.0)
 
@@ -542,7 +533,6 @@ def enrich_features(pool: pd.DataFrame) -> pd.DataFrame:
     df["form_k9"]      = forms.map(lambda d: d.get("form_k9", np.nan))
     df["form_bb9"]     = forms.map(lambda d: d.get("form_bb9", np.nan))
 
-    # Defaults if missing
     df["exp_ip"]      = df["exp_ip"].fillna(5.6)
     df["exp_pitches"] = df["exp_pitches"].fillna(92.0)
 
@@ -553,9 +543,181 @@ def enrich_features(pool: pd.DataFrame) -> pd.DataFrame:
     return df
 
 pool_feat = enrich_features(pool_base)
-
-# Enhanced model → q_final
 enh = apply_enhanced_model(pool_feat, weights_path="parlay/model_weights.json", blend=0.35)
+
+# ------------------------ Grouped player‑prop cards -------------------
+PROP_FAMS = {"Pitcher Ks":"PITCHER_KS","Pitcher BB":"PITCHER_BB","Pitcher Outs":"PITCHER_OUTS","Pitcher Win":"PITCHER_WIN"}
+
+def _fam_key(cat: str) -> tuple[str|None, str|None]:
+    c = (cat or "").lower()
+    if "strikeout" in c: return "PITCHER_KS","Pitcher Ks"
+    if "walk" in c and "pitcher" in c: return "PITCHER_BB","Pitcher BB"
+    if "outs" in c and "pitcher" in c: return "PITCHER_OUTS","Pitcher Outs"
+    if "record_a_win" in c: return "PITCHER_WIN","Pitcher Win"
+    return None, None
+
+def _choose_primary(line_map: dict) -> float|None:
+    """Pick the line whose Over/Under market is closest to 50/50."""
+    best_line, best_score = None, 1e9
+    for ln, sides in line_map.items():
+        # Use market probs to judge book balance near 0.5
+        cands = []
+        po = sides.get("over", {}).get("p")
+        pu = sides.get("under", {}).get("p")
+        if po is not None: cands.append(abs(po - 0.5))
+        if pu is not None: cands.append(abs(pu - 0.5))
+        if not cands: 
+            # final fallback: odds closest to -110
+            oov = sides.get("over", {}).get("odds")
+            ouv = sides.get("under", {}).get("odds")
+            if oov is None and ouv is None: continue
+            tie = min(abs((oov if oov is not None else -110) + 110),
+                      abs((ouv if ouv is not None else -110) + 110))
+            score = 0.50 + tie / 1000.0
+        else:
+            score = float(np.nanmin(cands))
+        if score < best_score:
+            best_score, best_line = score, ln
+    return best_line
+
+def group_props_rows(df: pd.DataFrame):
+    """Return a list of grouped dicts for cards."""
+    if df is None or df.empty: return []
+    props = df[df["player_name"].fillna("").ne("")].copy()
+    # attach family labels
+    fams = props["market_type"].apply(_fam_key)
+    props["fam_key"]   = fams.map(lambda t: t[0])
+    props["fam_label"] = fams.map(lambda t: t[1])
+    props = props[props["fam_key"].notna()]
+    props["line_float"] = pd.to_numeric(props["line"], errors="coerce")
+
+    groups = []
+    gcols = ["event_id","player_key","player_name","team_abbr","fam_key","fam_label"]
+    for gkey, gdf in props.groupby(gcols, dropna=False):
+        event_id, pkey, pname, team, fkey, flabel = gkey
+        # Build map line -> {over: {...}, under:{...}}
+        line_map = {}
+        for _, r in gdf.iterrows():
+            ln   = float(r["line"]) if pd.notna(r["line"]) else np.nan
+            side = (r.get("side") or "").lower()
+            if side not in ("over","under","yes","no"): 
+                continue
+            side = "over" if side in ("over","yes") else "under"
+            entry = dict(
+                q=float(r.get("q_final", r.get("q_model", np.nan))),
+                p=float(r.get("p_market", np.nan)),
+                odds=(int(r["american_odds"]) if pd.notna(r["american_odds"]) else None),
+                leg_id=r["leg_id"], desc=r["description"],
+                line=ln, team=_cap3(team)
+            )
+            line_map.setdefault(ln, {})[side] = entry
+
+        if not line_map:
+            continue
+
+        primary_ln = _choose_primary(line_map)
+        alt_lines  = sorted([ln for ln in line_map.keys() if ln != primary_ln], key=lambda x: (np.isnan(x), x))
+
+        groups.append(dict(
+            event_id=event_id,
+            player_key=pkey,
+            player_name=pname,
+            team_abbr=_cap3(team),
+            fam_key=fkey,
+            fam_label=flabel,
+            primary_line=primary_ln,
+            primary=line_map.get(primary_ln, {}),
+            alts=[(ln, line_map[ln]) for ln in alt_lines],
+        ))
+    # Sort by best primary edge
+    def best_primary_edge(g):
+        over = g["primary"].get("over", {})
+        under = g["primary"].get("under", {})
+        e_over  = (over.get("q", np.nan)  - over.get("p", np.nan))
+        e_under = (under.get("q", np.nan) - under.get("p", np.nan))
+        return max(e_over, e_under)
+    groups.sort(key=lambda g: best_primary_edge(g), reverse=True)
+    return groups
+
+def _chip(text): 
+    return f'<span style="background:#f5f6f7;border:1px solid #eee;border-radius:999px;padding:3px 8px;font-size:12px;color:#111;">{text}</span>'
+
+def render_grouped_cards(df_filtered: pd.DataFrame, key_prefix: str = "grp"):
+    groups = group_props_rows(df_filtered)
+    if not groups:
+        st.info("No player props available under current filters.")
+        return
+    for idx, g in enumerate(groups, 1):
+        short = first_init_last(g["player_name"])
+        team  = g["team_abbr"]
+        fam   = g["fam_label"]
+        head  = f"{short} ({team}) · {fam}"
+
+        # Primary chips
+        primary = g["primary"]
+        ln = g["primary_line"]
+        o = primary.get("over", {})
+        u = primary.get("under", {})
+        o_chip = _chip(f"Over {ln:g} · q {pct(o.get('q'))} · Mkt {pct(o.get('p'))} · {o.get('odds', '--'):+d}" if o else "Over —")
+        u_chip = _chip(f"Under {ln:g} · q {pct(u.get('q'))} · Mkt {pct(u.get('p'))} · {u.get('odds', '--'):+d}" if u else "Under —")
+
+        # Selection controls
+        st.markdown(
+            f"""
+            <div style="border:1px solid #eee;border-radius:14px;padding:14px 16px;background:#fff;margin-bottom:10px;">
+                <div style="font-weight:600;margin-bottom:6px;">{head}</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;">{o_chip}{u_chip}</div>
+            """, unsafe_allow_html=True
+        )
+        c1, c2, c3 = st.columns([1,1,2])
+        if o:
+            take_o = c1.checkbox("Took Over ✓", key=f"{key_prefix}_o_{idx}_{o['leg_id']}", value=(o["leg_id"] in ss["picks"]))
+            if take_o: ss["picks"][o["leg_id"]] = dict(time=datetime.now().isoformat(timespec="seconds"),
+                         leg_id=o["leg_id"], description=o["desc"], american_odds=o["odds"],
+                         q_final=o["q"], p_market=o["p"], edge=float(o["q"]-o["p"]),
+                         market_type=fam, team_abbr=team, player_name=g["player_name"], side="Over", line=ln)
+            else: ss["picks"].pop(o["leg_id"], None)
+        if u:
+            take_u = c2.checkbox("Took Under ✓", key=f"{key_prefix}_u_{idx}_{u['leg_id']}", value=(u["leg_id"] in ss["picks"]))
+            if take_u: ss["picks"][u["leg_id"]] = dict(time=datetime.now().isoformat(timespec="seconds"),
+                         leg_id=u["leg_id"], description=u["desc"], american_odds=u["odds"],
+                         q_final=u["q"], p_market=u["p"], edge=float(u["q"]-u["p"]),
+                         market_type=fam, team_abbr=team, player_name=g["player_name"], side="Under", line=ln)
+            else: ss["picks"].pop(u["leg_id"], None)
+
+        # Alt lines dropdown
+        with st.expander("Alt Lines", expanded=False):
+            if not g["alts"]:
+                st.caption("No alternates listed for this market.")
+            else:
+                # Picker
+                alt_options = [ln for ln,_ in g["alts"]]
+                sel = st.selectbox("Choose alt line", options=alt_options, key=f"{key_prefix}_altselect_{idx}")
+                # Show chips for chosen alt
+                alt_map = {ln: sides for ln, sides in g["alts"]}
+                sides = alt_map.get(sel, {})
+                ao = sides.get("over", {})
+                au = sides.get("under", {})
+                st.markdown(" — ".join([
+                    f"**Over {sel:g}** · q {pct(ao.get('q'))} · Mkt {pct(ao.get('p'))} · {ao.get('odds','--'):+d}" if ao else "Over —",
+                    f"**Under {sel:g}** · q {pct(au.get('q'))} · Mkt {pct(au.get('p'))} · {au.get('odds','--'):+d}" if au else "Under —",
+                ]))
+                colA, colB = st.columns(2)
+                if ao:
+                    pick = colA.checkbox("Pick Over (alt) ✓", key=f"{key_prefix}_alt_o_{idx}_{ao['leg_id']}", value=(ao["leg_id"] in ss["picks"]))
+                    if pick: ss["picks"][ao["leg_id"]] = dict(time=datetime.now().isoformat(timespec="seconds"),
+                                  leg_id=ao["leg_id"], description=ao["desc"], american_odds=ao["odds"],
+                                  q_final=ao["q"], p_market=ao["p"], edge=float(ao["q"]-ao["p"]),
+                                  market_type=fam, team_abbr=team, player_name=g["player_name"], side="Over", line=sel)
+                    else: ss["picks"].pop(ao["leg_id"], None)
+                if au:
+                    pick = colB.checkbox("Pick Under (alt) ✓", key=f"{key_prefix}_alt_u_{idx}_{au['leg_id']}", value=(au["leg_id"] in ss["picks"]))
+                    if pick: ss["picks"][au["leg_id"]] = dict(time=datetime.now().isoformat(timespec="seconds"),
+                                  leg_id=au["leg_id"], description=au["desc"], american_odds=au["odds"],
+                                  q_final=au["q"], p_market=au["p"], edge=float(au["q"]-au["p"]),
+                                  market_type=fam, team_abbr=team, player_name=g["player_name"], side="Under", line=sel)
+                    else: ss["picks"].pop(au["leg_id"], None)
+        st.markdown("</div>", unsafe_allow_html=True)
 
 # ------------------------ Filters & UI scaffold ----------------------
 with st.expander("Filters", expanded=True):
@@ -577,61 +739,24 @@ if not f.empty:
     f = f[(f["american_odds"].fillna(0).astype(float) >= od_min) &
           (f["american_odds"].fillna(0).astype(float) <= od_max)]
 
-tabs = st.tabs(["Candidates","Top 20","My Picks","ML Winners & RL Locks","Downloads","Debug"])
+tabs = st.tabs(["Props (Grouped)","ML/RL","My Picks","Downloads","Debug"])
 
 with tabs[0]:
-    st.subheader("Candidates")
-    if f.empty:
-        st.info("No rows. Fetch data or relax filters.")
-    else:
-        show_cols = ["description","category","american_odds","q_final","p_market","edge"]
-        pretty = f[show_cols].rename(columns={"american_odds":"Odds","q_final":"q (model)","p_market":"Market %","edge":"Edge"})
-        pretty["q (model)"] = pretty["q (model)"].map(lambda x: pct(x,1))
-        pretty["Market %"]  = pretty["Market %"].map(lambda x: pct(x,1))
-        pretty["Edge"]      = pretty["Edge"].map(lambda x: f"{x:+.1%}")
-        st.dataframe(pretty, use_container_width=True, hide_index=True)
+    st.subheader("Player Props — Grouped by Player/Market")
+    render_grouped_cards(f, key_prefix="grp")
 
 with tabs[1]:
-    st.subheader("Top 20 (by edge, then odds)")
-    if f.empty:
-        st.info("No rows to rank.")
+    st.subheader("ML & Run Line")
+    ml = f[f["category"].isin(["Moneyline","Run Line"])].copy() if not f.empty else pd.DataFrame()
+    if ml.empty:
+        st.info("No ML/RL rows available.")
     else:
-        top = f.sort_values(["edge","q_final","american_odds"], ascending=[False,False,True]).head(20)
-        for _, r in top.iterrows():
-            chips = []
-            if "alternate" in _s(r["market_type"]).lower():
-                chips.append("Alt")
-            chips.extend([
-                f"Odds {int(r['american_odds']) if pd.notna(r['american_odds']) else '--'}",
-                f"q {pct(r['q_final'])}",
-                f"Market {pct(r['p_market'])}",
-                f"Edge {r['edge']:+.1%}",
-            ])
-            checked = st.checkbox("Took ✓", key=f"take_{r['leg_id']}", value=(r["leg_id"] in ss["picks"]))
-            if checked:
-                ss["picks"][r["leg_id"]] = dict(
-                    time=datetime.now().isoformat(timespec="seconds"),
-                    leg_id=r["leg_id"], description=r["description"],
-                    american_odds=int(r["american_odds"]) if pd.notna(r["american_odds"]) else None,
-                    q_final=float(r["q_final"]), p_market=float(r["p_market"]),
-                    edge=float(r["edge"]), market_type=r["market_type"],
-                    team_abbr=r["team_abbr"], player_name=r.get("player_name"),
-                    side=r.get("side"), line=r.get("line"), matchup=r.get("matchup"),
-                )
-            else:
-                ss["picks"].pop(r["leg_id"], None)
-
-            st.markdown(
-                f"""
-                <div style="border:1px solid #eee;border-radius:14px;padding:14px 16px;background:#fff;">
-                    <div style="font-weight:600;margin-bottom:6px;">{r['description']}</div>
-                    <div style="display:flex;gap:8px;flex-wrap:wrap;margin:6px 0;">
-                        {''.join([f'<span style="background:#f5f6f7;border:1px solid #eee;border-radius:999px;padding:3px 8px;font-size:12px;color:#111;">{c}</span>' for c in chips])}
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True
-            )
+        show = ml[["description","american_odds","q_final","p_market"]].rename(columns={
+            "american_odds":"Odds","q_final":"q (model)","p_market":"Market %"
+        })
+        show["q (model)"] = show["q (model)"].map(lambda x: pct(x,1))
+        show["Market %"]  = show["Market %"].map(lambda x: pct(x,1))
+        st.dataframe(show, use_container_width=True, hide_index=True)
 
 with tabs[2]:
     st.subheader("My Picks")
@@ -653,20 +778,6 @@ with tabs[2]:
         )
 
 with tabs[3]:
-    st.subheader("ML Winners & RL Locks")
-    ml = f[f["category"].isin(["Moneyline","Run Line"])].copy() if not f.empty else pd.DataFrame()
-    if ml.empty:
-        st.info("No ML/RL rows available.")
-    else:
-        show = ml[["description","american_odds","q_final","p_market","edge"]].rename(columns={
-            "american_odds":"Odds","q_final":"q (model)","p_market":"Market %","edge":"Edge"
-        })
-        show["q (model)"] = show["q (model)"].map(lambda x: pct(x,1))
-        show["Market %"]  = show["Market %"].map(lambda x: pct(x,1))
-        show["Edge"]      = show["Edge"].map(lambda x: f"{x:+.1%}")
-        st.dataframe(show, use_container_width=True, hide_index=True)
-
-with tabs[4]:
     st.subheader("Downloads")
     def dl(df, label, fn):
         if df is None or df.empty: st.button(label, disabled=True)
@@ -678,7 +789,7 @@ with tabs[4]:
     dl(board_df,  "Download Board CSV",  f"board_{today}.csv")
     dl(props_df,  "Download Props CSV",  f"props_{today}.csv")
 
-with tabs[5]:
+with tabs[4]:
     dbg = dict(
         events_rows=len(events_df),
         board_rows=len(board_df),
@@ -691,184 +802,3 @@ with tabs[5]:
         last_snapshot_ts=ss.get("last_snapshot_ts"),
     )
     st.code(json.dumps(dbg, indent=2))
-
-# ---------------- High‑odds (8–9) and Top‑8 helpers ------------------
-ALLOWED_MARKETS = {
-    "Pitcher Win", "Pitcher Wins", "pitcher_record_a_win",
-    "Pitcher Outs", "pitcher_outs",
-    "Pitcher Strikeouts", "pitcher_strikeouts",
-    "Pitcher Walks", "pitcher_walks",
-}
-def _to_decimal_from_american(a):
-    try:
-        a = float(a);  return 1 + (a/100.0) if a >= 0 else 1 + (100.0/abs(a))
-    except Exception:
-        return math.nan
-def _to_prob_from_decimal(d):
-    try:
-        d = float(d);  return 1.0/d if d > 1 else math.nan
-    except Exception:
-        return math.nan
-def _to_prob_from_percentish(x):
-    try:
-        if isinstance(x, str) and x.strip().endswith("%"):
-            return float(x.strip().replace("%",""))/100.0
-        xv = float(x); return xv/100.0 if xv > 1.01 else xv
-    except Exception:
-        return math.nan
-def _pct(x): return f"{round(100*float(x))}%" if x==x else "--"
-
-def normalize_pool_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = (df or pd.DataFrame()).copy()
-    if "american_odds" not in df.columns:
-        df["american_odds"] = math.nan
-    if "decimal_odds" not in df.columns:
-        df["decimal_odds"] = df["american_odds"].apply(_to_decimal_from_american)
-    if "p_market" not in df.columns:
-        df["p_market"] = df["decimal_odds"].apply(_to_prob_from_decimal)
-    # prefer q_final, fall back to q_model
-    if "q_model" not in df.columns:
-        df["q_model"] = df.get("q_final", np.nan)
-    if "category" not in df.columns:
-        df["category"] = df.get("market_type","")
-    if "player_name" not in df.columns:
-        df["player_name"] = df.get("player","")
-    if "team_abbr" not in df.columns:
-        df["team_abbr"] = df.get("team","")
-    if "game_id" not in df.columns:
-        df["game_id"] = df.get("event_id","")
-    df["player_key"] = df["player_name"].fillna("").str.replace(r"\.","", regex=True).str.strip().str.lower()
-    if "edge" not in df.columns:
-        df["edge"] = df.get("q_final", df["p_market"]) - df["p_market"]
-    if "ev" not in df.columns:
-        df["ev"] = df.get("q_final", df["p_market"]) * (df["decimal_odds"] - 1) - (1 - df.get("q_final", df["p_market"]))
-    dedup_keys = [k for k in ["game_id","team_abbr","player_key","category","side","line","american_odds"] if k in df.columns]
-    if dedup_keys:
-        df = df.drop_duplicates(subset=dedup_keys).reset_index(drop=True)
-    return df
-
-def is_allowed_market(cat: str) -> bool:
-    if not isinstance(cat,str): return False
-    c = cat.strip().lower()
-    if any(c == k.lower() for k in ALLOWED_MARKETS): return True
-    if "strikeout" in c or "outs" in c or "walk" in c or "win" in c: return True
-    return False
-
-def value_boost(american):
-    try:
-        a = float(american);  return 0.20*(a/100.0) if a > 0 else 0.10*(-a/150.0)
-    except Exception:
-        return 0.0
-def variance_penalty(row):
-    desc = str(row.get("description","")).upper()
-    if "COORS" in desc or " @ COL" in desc or "COL@" in desc: return 8.0
-    return 0.0
-def parlay_score(row):
-    q = float(row.get("q_final", row.get("q_model", math.nan)))
-    p = float(row.get("p_market", math.nan))
-    a = row.get("american_odds", 0)
-    if not (q==q and p==p): return -1e9
-    edge = (q - p) * 100.0
-    conf = (q - 0.50) * 100.0
-    vb   = value_boost(a) * 100.0
-    pen  = variance_penalty(row)
-    bonus = 2.0 if "win" in str(row.get("category","")).lower() else 0.0
-    return edge + 0.75*conf + vb + bonus - pen
-
-def build_top8(pool: pd.DataFrame, target_legs=8, min_q=0.60, min_edge=0.0):
-    df = normalize_pool_columns(pool)
-    if df.empty: return [], {}
-    def ok_row(r):
-        if not is_allowed_market(r.get("category","")): return False
-        try: a = float(r.get("american_odds", -9999))
-        except: return False
-        lc = str(r.get("category","")).lower()
-        if "win" in lc: return -200 <= a <= +180
-        return -260 <= a <= +220
-    df = df[df.apply(ok_row, axis=1)].copy()
-    df = df[(df.get("q_final", df["q_model"]) >= min_q) & (df["edge"] >= min_edge)].copy()
-    if df.empty: return [], {}
-
-    df["score"] = df.apply(parlay_score, axis=1)
-    used_games, used_pitchers, picks = set(), set(), []
-
-    wins = df[df["category"].str.lower().str.contains("win")].sort_values("score", ascending=False)
-    for _, r in wins.iterrows():
-        g, pk = r.get("game_id",""), r.get("player_key","")
-        if g in used_games or pk in used_pitchers: continue
-        picks.append(r); used_games.add(g); used_pitchers.add(pk)
-        if len([x for x in picks if "win" in str(x.get("category","")).lower()]) >= 5: break
-    rest = df[~df.index.isin([r.name for r in picks])].sort_values("score", ascending=False)
-    for _, r in rest.iterrows():
-        g, pk = r.get("game_id",""), r.get("player_key","")
-        if g in used_games or pk in used_pitchers: continue
-        picks.append(r); used_games.add(g); used_pitchers.add(pk)
-        if len(picks) >= target_legs: break
-
-    if not picks: return [], {}
-    P = float(np.prod([float(x.get("q_final", x.get("q_model",0.0))) for x in picks]))
-    D = float(np.prod([float(x.get("decimal_odds",1.0)) for x in picks]))
-    EV = P*(D - 1) - (1 - P)
-
-    def fmt_card(r):
-        name = str(r.get("player_name","")).strip()
-        team = str(r.get("team_abbr","")).strip().upper()[:3]
-        if name and "." not in name and " " in name:
-            name = f"{name.split()[0][0]}. {' '.join(name.split()[1:])}"
-        cat  = str(r.get("category",""))
-        side = str(r.get("side","")).capitalize() if r.get("side","") else ""
-        line = str(r.get("line",""))
-        desc = str(r.get("description",""))
-        if not side or side.lower() not in {"over","under","yes","no"}:
-            m = re.search(r"\b(Over|Under|Yes|No)\b", desc, re.I)
-            if m: side = m.group(1).capitalize()
-        if not line.strip():
-            m = re.search(r"([0-9]+(\.[05])?)", desc)
-            if m: line = m.group(1)
-        label = ("Ks" if "strikeout" in cat.lower()
-                 else "Outs" if "outs" in cat.lower()
-                 else "BB" if "walk" in cat.lower()
-                 else "Win" if "win" in cat.lower()
-                 else cat)
-        odds = int(float(r.get("american_odds",0)))
-        q = float(r.get("q_final", r.get("q_model", math.nan)))
-        p = float(r.get("p_market", math.nan))
-        chips = f"Odds {odds:+d} · q {_pct(q)} · Market {_pct(p)} · Edge {_pct(q-p)}"
-        who = name or "(?)"; t = f" ({team})" if team else ""
-        head = f"{who}{t} — {('Win '+side) if label=='Win' else f'{side} {line} {label}'}"
-        return head, chips
-
-    cards = [fmt_card(r) for r in picks]
-    summary = {
-        "legs": len(picks),
-        "hit_prob_est": P,
-        "decimal_combined": D,
-        "american_combined": (D-1)*100 if D>1 else 0,
-        "ev_est": EV,
-        "note": "Top‑8: up to five Pitcher Wins, then Outs/Ks/Walks; q≥60%, edge≥0; no dup pitcher/game."
-    }
-    return cards, summary
-
-def render_top8_section(pool_base: pd.DataFrame):
-    st.subheader("Top 8 Picks — Today")
-    if pool_base is None or (isinstance(pool_base, pd.DataFrame) and pool_base.empty):
-        st.info("No candidate legs in memory. Fetch or upload board/props first.")
-        return
-    cards, summ = build_top8(enh, target_legs=8, min_q=0.60, min_edge=0.00)
-    if not cards:
-        st.warning("No qualifying legs (q≥60%, edge≥0). Loosen odds/markets or refresh.")
-        return
-    c1,c2,c3 = st.columns(3)
-    c1.metric("Legs", summ["legs"])
-    c2.metric("Est. Hit", pct(summ["hit_prob_est"]))
-    c3.metric("Est. American", f"{int(round(summ['american_combined'])):+d}")
-    st.caption(summ["note"])
-    lines = []
-    for i,(h,c) in enumerate(cards,1):
-        st.markdown(f"**{i}. {h}**")
-        st.caption(c)
-        lines.append(f"{i}. {h}  —  {c}")
-    st.text_area("Copy picks", value="\n".join(lines), height=180)
-
-with st.expander("Auto Picks", expanded=True):
-    render_top8_section(pool_base)
